@@ -1,0 +1,341 @@
+// Linux x86_64 libdbus-1 binding. Native iterator/error layouts are verified
+// against the system headers by tests/abi.c. Never access private iterator fields.
+import "ffi"
+struct NativeConnection {}
+struct NativeMessage {}
+extern "C" fn dbus_threads_init_default() i32
+extern "C" fn dbus_bus_get_private(kind i32, error *mut u64) *mut NativeConnection
+extern "C" fn dbus_connection_set_exit_on_disconnect(bus *mut NativeConnection, enabled i32)
+extern "C" fn dbus_connection_close(bus *mut NativeConnection)
+extern "C" fn dbus_connection_unref(bus *mut NativeConnection)
+extern "C" fn dbus_error_init(error *mut u64)
+extern "C" fn dbus_error_free(error *mut u64)
+extern "C" fn dbus_message_new_method_call(destination *u8, path *u8, interface_name *u8, member *u8) *mut NativeMessage
+extern "C" fn dbus_message_unref(message *mut NativeMessage)
+extern "C" fn dbus_message_iter_init_append(message *mut NativeMessage, iter *mut u64)
+extern "C" fn dbus_message_iter_append_basic(iter *mut u64, kind i32, value *u8) i32
+extern "C" fn dbus_connection_send_with_reply_and_block(bus *mut NativeConnection, message *mut NativeMessage, timeout i32, error *mut u64) *mut NativeMessage
+extern "C" fn dbus_message_iter_init(message *mut NativeMessage, iter *mut u64) i32
+extern "C" fn dbus_message_iter_next(iter *mut u64) i32
+extern "C" fn dbus_message_iter_get_arg_type(iter *mut u64) i32
+extern "C" fn dbus_message_iter_get_basic(iter *mut u64, value *mut u64)
+extern "C" fn dbus_message_iter_recurse(iter *mut u64, child *mut u64)
+extern "C" fn dbus_validate_bus_name(name *u8, error *mut u64) i32
+extern "C" fn dbus_validate_path(name *u8, error *mut u64) i32
+extern "C" fn dbus_validate_interface(name *u8, error *mut u64) i32
+extern "C" fn dbus_validate_member(name *u8, error *mut u64) i32
+
+pub struct Error { pub name string
+    pub message string }
+fn make_error(name &string, message &string) Error { return Error{name: name.clone(), message: message.clone()} }
+pub enum Value {
+    Text(string)
+    Bool(bool)
+    U32(u32)
+    I32(i32)
+    U64(u64)
+    List(Vec<Value>)
+    Tuple(Vec<Value>)
+    Entry(Vec<Value>)
+    Variant(Vec<Value>)
+}
+/// Opaque borrowed session authority. Can only be obtained inside with_session.
+/// No raw handles escape; calls are blocking and require an exclusive receiver.
+pub struct Connection { native *mut NativeConnection }
+fn cstring(value &string) Result<ffi.CString, Error> {
+    return ffi.CString.new(value).ok_or(make_error("tarn.dbus.InvalidArgument", "D-Bus strings cannot contain NUL"))
+}
+fn native_error(words &[4]u64) Error {
+    var name = "tarn.dbus.TransportError"
+    var message = "D-Bus operation failed"
+    if words[0] != 0 {
+        ptr: *mut u8 := ffi.from_address(usize(words[0]))
+        unsafe { name = ffi.string_from_c(ffi.to_const(ptr)).unwrap_or(name) }
+    }
+    if words[1] != 0 {
+        ptr: *mut u8 := ffi.from_address(usize(words[1]))
+        unsafe { message = ffi.string_from_c(ffi.to_const(ptr)).unwrap_or(message) }
+    }
+    return Error{name: name, message: message}
+}
+/// Private connection is closed/unreferenced on every ordinary callback result,
+/// including Err. Panic remains process abort, following Tarn semantics.
+pub fn with_session(work fn(&mut Connection) Result<void, Error>) Result<void, Error> {
+    var ready: i32 = 0
+    unsafe { ready = dbus_threads_init_default() }
+    if ready == 0 { return Err(make_error("tarn.dbus.OutOfMemory", "Cannot initialize native synchronization")) }
+    var words = [4]u64{0, 0, 0, 0}
+    var native: *mut NativeConnection = ffi.null()
+    unsafe {
+        dbus_error_init(ffi.slice_mut(&mut words))
+        native = dbus_bus_get_private(0, ffi.slice_mut(&mut words))
+    }
+    if ffi.is_null(ffi.to_const(native)) {
+        failure := native_error(&words)
+        unsafe { dbus_error_free(ffi.slice_mut(&mut words)) }
+        return Err(failure)
+    }
+    unsafe {
+        dbus_error_free(ffi.slice_mut(&mut words))
+        dbus_connection_set_exit_on_disconnect(native, 0)
+    }
+    var connection = Connection{native: native}
+    result := work(&mut connection)
+    unsafe { dbus_connection_close(native)
+        dbus_connection_unref(native) }
+    return result
+}
+fn decode(iter *mut u64, depth usize, count &mut usize) Result<Value, Error> {
+    if depth > 32 || *count >= 4096 { return Err(make_error("tarn.dbus.LimitExceeded", "Reply nesting/value count exceeded")) }
+    *count = *count + 1
+    var kind: i32 = 0
+    unsafe { kind = dbus_message_iter_get_arg_type(iter) }
+    if kind == 115 || kind == 111 || kind == 103 {
+        var raw: u64 = 0
+        unsafe { dbus_message_iter_get_basic(iter, ffi.of_mut(&mut raw)) }
+        if raw == 0 { return Err(make_error("tarn.dbus.InvalidReply", "Null text value")) }
+        ptr: *mut u8 := ffi.from_address(usize(raw))
+        var value: Option<string> = None
+        unsafe { value = ffi.string_from_c(ffi.to_const(ptr)) }
+        return Ok(Value.Text(try value.ok_or(make_error("tarn.dbus.InvalidReply", "Reply text is not UTF-8"))))
+    }
+    if kind == 105 {
+        var signed: i32 = 0
+        ptr: *mut u64 := ffi.from_address(ffi.address(ffi.to_const(ffi.of_mut(&mut signed))))
+        unsafe { dbus_message_iter_get_basic(iter, ptr) }
+        return Ok(Value.I32(signed))
+    }
+    if kind == 98 || kind == 117 || kind == 116 {
+        var raw: u64 = 0
+        unsafe { dbus_message_iter_get_basic(iter, ffi.of_mut(&mut raw)) }
+        if kind == 98 { return Ok(Value.Bool(raw != 0)) }
+        if kind == 117 { return Ok(Value.U32(u32(raw))) }
+        return Ok(Value.U64(raw))
+    }
+    if kind == 97 || kind == 114 || kind == 101 || kind == 118 {
+        var child = [9]u64{0, 0, 0, 0, 0, 0, 0, 0, 0}
+        unsafe { dbus_message_iter_recurse(iter, ffi.slice_mut(&mut child)) }
+        values := try decode_all(ffi.slice_mut(&mut child), depth + 1, count)
+        if kind == 97 { return Ok(Value.List(values)) }
+        if kind == 114 { return Ok(Value.Tuple(values)) }
+        if kind == 101 { return Ok(Value.Entry(values)) }
+        return Ok(Value.Variant(values))
+    }
+    return Err(make_error("tarn.dbus.UnsupportedType", "Reply contains a type not supported by this library version"))
+}
+fn decode_all(iter *mut u64, depth usize, count &mut usize) Result<Vec<Value>, Error> {
+    var values: Vec<Value> = Vec.new()
+    for {
+        var kind: i32 = 0
+        unsafe { kind = dbus_message_iter_get_arg_type(iter) }
+        if kind == 0 { break }
+        values.push(try decode(iter, depth, count))
+        var next: i32 = 0
+        unsafe { next = dbus_message_iter_next(iter) }
+        if next == 0 { break }
+    }
+    return Ok(values)
+}
+/// Calls a method with zero or more string arguments. Native errors preserve
+/// their D-Bus name/message. Replies are copied into ordinary owned Tarn values.
+/// Timeout must be 1..60000 ms; no infinite waits or hidden retries.
+pub fn Connection.call_strings(&mut self, destination &string, path &string, interface_name &string, member &string, arguments &Vec<string>, timeout_ms i32) Result<Vec<Value>, Error> {
+    if timeout_ms <= 0 || timeout_ms > 60000 { return Err(make_error("tarn.dbus.InvalidArgument", "Timeout must be 1..60000 milliseconds")) }
+    dest := try cstring(destination)
+    obj := try cstring(path)
+    iface := try cstring(interface_name)
+    method := try cstring(member)
+    var valid: i32 = 0
+    var no_error: *mut u64 = ffi.null()
+    unsafe { valid = dbus_validate_bus_name(dest.as_ptr(), no_error) * dbus_validate_path(obj.as_ptr(), no_error) * dbus_validate_interface(iface.as_ptr(), no_error) * dbus_validate_member(method.as_ptr(), no_error) }
+    if valid == 0 { return Err(make_error("tarn.dbus.InvalidArgument", "Invalid bus name, object path, interface_name or member")) }
+    var encoded: Vec<ffi.CString> = Vec.new()
+    for arg in arguments.as_slice() { encoded.push(try cstring(arg)) }
+    var request: *mut NativeMessage = ffi.null()
+    unsafe { request = dbus_message_new_method_call(dest.as_ptr(), obj.as_ptr(), iface.as_ptr(), method.as_ptr()) }
+    if ffi.is_null(ffi.to_const(request)) { return Err(make_error("tarn.dbus.OutOfMemory", "Cannot allocate request")) }
+    var iter = [9]u64{0, 0, 0, 0, 0, 0, 0, 0, 0}
+    unsafe { dbus_message_iter_init_append(request, ffi.slice_mut(&mut iter)) }
+    for arg in encoded.as_slice() {
+        ptr := arg.as_ptr()
+        // append_basic copies the C string before the next iteration.
+        raw := ffi.of(&ptr)
+        bytes: *mut u8 := ffi.from_address(ffi.address(raw))
+        var ok: i32 = 0
+        unsafe { ok = dbus_message_iter_append_basic(ffi.slice_mut(&mut iter), 115, ffi.to_const(bytes)) }
+        if ok == 0 { unsafe { dbus_message_unref(request) }
+            return Err(make_error("tarn.dbus.OutOfMemory", "Cannot append request argument")) }
+    }
+    var words = [4]u64{0, 0, 0, 0}
+    var reply: *mut NativeMessage = ffi.null()
+    unsafe {
+        dbus_error_init(ffi.slice_mut(&mut words))
+        reply = dbus_connection_send_with_reply_and_block(self.native, request, timeout_ms, ffi.slice_mut(&mut words))
+        dbus_message_unref(request)
+    }
+    if ffi.is_null(ffi.to_const(reply)) {
+        failure := native_error(&words)
+        unsafe { dbus_error_free(ffi.slice_mut(&mut words)) }
+        return Err(failure)
+    }
+    var started: i32 = 0
+    unsafe { dbus_error_free(ffi.slice_mut(&mut words))
+        started = dbus_message_iter_init(reply, ffi.slice_mut(&mut iter)) }
+    if started == 0 { unsafe { dbus_message_unref(reply) }
+        return Ok(Vec.new()) }
+    var count: usize = 0
+    result := decode_all(ffi.slice_mut(&mut iter), 0, &mut count)
+    unsafe { dbus_message_unref(reply) }
+    return result
+}
+
+/// Ordinary callers need not inspect the wire representation for common tasks.
+pub fn Connection.list_names(&mut self) Result<Vec<string>, Error> {
+    args: Vec<string> := Vec.new()
+    reply := try self.call_strings("org.freedesktop.DBus", "/org/freedesktop/DBus", "org.freedesktop.DBus", "ListNames", &args, 2000)
+    if reply.len() != 1 { return Err(make_error("tarn.dbus.InvalidReply", "Expected one ListNames result")) }
+    var names: Vec<string> = Vec.new()
+    match reply.get(0) {
+        Value.List(values) => {
+            for value in values.as_slice() {
+                match value { Value.Text(name) => { names.push(name.clone()) }
+                    _ => { return Err(make_error("tarn.dbus.InvalidReply", "Expected a list of bus names")) } }
+            }
+        }
+        _ => { return Err(make_error("tarn.dbus.InvalidReply", "Expected a list of bus names")) }
+    }
+    return Ok(names)
+}
+pub fn Connection.name_owner(&mut self, name &string) Result<string, Error> {
+    var args: Vec<string> = Vec.new()
+    args.push(name.clone())
+    reply := try self.call_strings("org.freedesktop.DBus", "/org/freedesktop/DBus", "org.freedesktop.DBus", "GetNameOwner", &args, 2000)
+    if reply.len() != 1 { return Err(make_error("tarn.dbus.InvalidReply", "Expected one name owner")) }
+    match reply.get(0) { Value.Text(owner) => { return Ok(owner.clone()) }
+        _ => { return Err(make_error("tarn.dbus.InvalidReply", "Expected a name owner string")) } }
+}
+
+extern "C" fn dbus_bus_request_name(bus *mut NativeConnection, name *u8, flags u32, failure *mut u64) i32
+extern "C" fn dbus_bus_add_match(bus *mut NativeConnection, rule *u8, failure *mut u64)
+extern "C" fn dbus_bus_remove_match(bus *mut NativeConnection, rule *u8, failure *mut u64)
+extern "C" fn dbus_connection_read_write(bus *mut NativeConnection, timeout i32) i32
+extern "C" fn dbus_connection_pop_message(bus *mut NativeConnection) *mut NativeMessage
+extern "C" fn dbus_connection_send(bus *mut NativeConnection, message *mut NativeMessage, serial *mut u32) i32
+extern "C" fn dbus_message_new_signal(path *u8, iface *u8, member *u8) *mut NativeMessage
+extern "C" fn dbus_message_get_type(message *mut NativeMessage) i32
+extern "C" fn dbus_message_get_path(message *mut NativeMessage) *u8
+extern "C" fn dbus_message_get_interface(message *mut NativeMessage) *u8
+extern "C" fn dbus_message_get_member(message *mut NativeMessage) *u8
+extern "C" fn dbus_message_get_sender(message *mut NativeMessage) *u8
+
+/// Name is acquired without queuing or replacing an existing owner.
+/// Its lifetime ends with the scoped private connection.
+pub fn Connection.request_name(&mut self, name &string) Result<void, Error> {
+    text := try cstring(name)
+    var none: *mut u64 = ffi.null()
+    var valid: i32 = 0
+    unsafe { valid = dbus_validate_bus_name(text.as_ptr(), none) }
+    if valid == 0 || name.bytes()[0] == 58 { return Err(make_error("tarn.dbus.InvalidArgument", "Expected a well-known bus name")) }
+    var failure = [4]u64{0, 0, 0, 0}
+    var status: i32 = 0
+    unsafe { dbus_error_init(ffi.slice_mut(&mut failure))
+        status = dbus_bus_request_name(self.native, text.as_ptr(), 4, ffi.slice_mut(&mut failure)) }
+    if status == -1 {
+        result := native_error(&failure)
+        unsafe { dbus_error_free(ffi.slice_mut(&mut failure)) }
+        return Err(result)
+    }
+    unsafe { dbus_error_free(ffi.slice_mut(&mut failure)) }
+    if status != 1 && status != 4 { return Err(make_error("tarn.dbus.NameUnavailable", "Another connection owns this name")) }
+    return Ok(())
+}
+fn change_match(bus *mut NativeConnection, rule &string, add bool) Result<void, Error> {
+    text := try cstring(rule)
+    var failure = [4]u64{0, 0, 0, 0}
+    unsafe { dbus_error_init(ffi.slice_mut(&mut failure))
+        if add { dbus_bus_add_match(bus, text.as_ptr(), ffi.slice_mut(&mut failure)) } else { dbus_bus_remove_match(bus, text.as_ptr(), ffi.slice_mut(&mut failure)) } }
+    if failure[0] != 0 {
+        result := native_error(&failure)
+        unsafe { dbus_error_free(ffi.slice_mut(&mut failure)) }
+        return Err(result)
+    }
+    unsafe { dbus_error_free(ffi.slice_mut(&mut failure)) }
+    return Ok(())
+}
+/// Match rules use the native D-Bus grammar; malformed rules return remote errors.
+pub fn Connection.add_match(&mut self, rule &string) Result<void, Error> { return change_match(self.native, rule, true) }
+pub fn Connection.remove_match(&mut self, rule &string) Result<void, Error> { return change_match(self.native, rule, false) }
+fn optional_text(pointer *u8) string {
+    if ffi.is_null(pointer) { return "" }
+    unsafe { return ffi.string_from_c(pointer).unwrap_or("") }
+}
+/// Owned message data, with no escaping native storage. Type: 1 call, 2 return,
+/// 3 error, 4 signal. Absent metadata is represented by an empty string.
+pub struct Message {
+    pub kind i32
+    pub path string
+    pub interface_name string
+    pub member string
+    pub sender string
+    pub values Vec<Value>
+}
+/// Pops at most one incoming message. Wait is bounded to 0..60000 milliseconds.
+/// None means no message yet; disconnected transport returns Err.
+pub fn Connection.receive(&mut self, timeout_ms i32) Result<Option<Message>, Error> {
+    if timeout_ms < 0 || timeout_ms > 60000 { return Err(make_error("tarn.dbus.InvalidArgument", "Receive wait must be 0..60000 milliseconds")) }
+    var native: *mut NativeMessage = ffi.null()
+    unsafe { native = dbus_connection_pop_message(self.native) }
+    if ffi.is_null(ffi.to_const(native)) {
+        var connected: i32 = 0
+        unsafe { connected = dbus_connection_read_write(self.native, timeout_ms)
+            native = dbus_connection_pop_message(self.native) }
+        if ffi.is_null(ffi.to_const(native)) {
+            if connected == 0 { return Err(make_error("tarn.dbus.Disconnected", "Session bus disconnected")) }
+            return Ok(None)
+        }
+    }
+    var kind: i32 = 0
+    var path = ""
+    var iface = ""
+    var member = ""
+    var sender = ""
+    var iter = [9]u64{0, 0, 0, 0, 0, 0, 0, 0, 0}
+    var started: i32 = 0
+    unsafe { kind = dbus_message_get_type(native)
+        path = optional_text(dbus_message_get_path(native))
+        iface = optional_text(dbus_message_get_interface(native))
+        member = optional_text(dbus_message_get_member(native))
+        sender = optional_text(dbus_message_get_sender(native))
+        started = dbus_message_iter_init(native, ffi.slice_mut(&mut iter)) }
+    var count: usize = 0
+    var values: Vec<Value> = Vec.new()
+    if started != 0 {
+        match decode_all(ffi.slice_mut(&mut iter), 0, &mut count) {
+            Ok(decoded) => { values = decoded }
+            Err(failure) => { unsafe { dbus_message_unref(native) }
+                return Err(failure) }
+        }
+    }
+    unsafe { dbus_message_unref(native) }
+    return Ok(Some(Message{kind: kind, path: path, interface_name: iface, member: member, sender: sender, values: values}))
+}
+/// Queues an empty signal. receive() services outgoing transport without an
+/// unbounded flush. This method does not promise remote delivery/acknowledgment.
+pub fn Connection.signal(&mut self, path &string, interface_name &string, member &string) Result<void, Error> {
+    obj := try cstring(path)
+    iface := try cstring(interface_name)
+    method := try cstring(member)
+    var none: *mut u64 = ffi.null()
+    var valid: i32 = 0
+    unsafe { valid = dbus_validate_path(obj.as_ptr(), none) * dbus_validate_interface(iface.as_ptr(), none) * dbus_validate_member(method.as_ptr(), none) }
+    if valid == 0 { return Err(make_error("tarn.dbus.InvalidArgument", "Invalid signal path, interface or member")) }
+    var message: *mut NativeMessage = ffi.null()
+    unsafe { message = dbus_message_new_signal(obj.as_ptr(), iface.as_ptr(), method.as_ptr()) }
+    if ffi.is_null(ffi.to_const(message)) { return Err(make_error("tarn.dbus.OutOfMemory", "Cannot allocate signal")) }
+    var ok: i32 = 0
+    var serial: u32 = 0
+    unsafe { ok = dbus_connection_send(self.native, message, ffi.of_mut(&mut serial))
+        dbus_message_unref(message) }
+    if ok == 0 { return Err(make_error("tarn.dbus.OutOfMemory", "Cannot queue signal")) }
+    return Ok(())
+}

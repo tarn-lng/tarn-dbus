@@ -1,0 +1,5 @@
+import "src/dbus"
+fn escape(bus &mut dbus.Connection) dbus.Connection {
+    return *bus
+}
+fn main() {}

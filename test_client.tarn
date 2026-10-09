@@ -1,0 +1,136 @@
+import "src/dbus"
+import "fs"
+fn check(bus &mut dbus.Connection) Result<void, dbus.Error> {
+    try bus.request_name("org.tarn.Client")
+    if (try bus.name_owner("org.tarn.Client")).len() == 0 { panic("name not owned") }
+    rule := "type='signal',interface='org.tarn.SignalTest',member='Ping'"
+    try bus.add_match(&rule)
+    try bus.signal("/Test", "org.tarn.SignalTest", "Ping")
+    var found = false
+    for i in 0..20 {
+        match try bus.receive(100) {
+            Some(message) => {
+                if message.kind == 4 && message.interface_name == "org.tarn.SignalTest" && message.member == "Ping" {
+                    if message.path != "/Test" || message.sender.len() == 0 || message.values.len() != 0 { panic("signal metadata") }
+                    found = true
+                    break
+                }
+            }
+            None => {}
+        }
+    }
+    if !found { panic("signal delivery missing") }
+    try bus.remove_match(&rule)
+    match bus.add_match("this is not a valid match rule") {
+        Err(_) => {}
+        Ok(_) => { panic("malformed signal match accepted") }
+    }
+    match bus.signal("not/a/path", "org.tarn.SignalTest", "Ping") {
+        Err(_) => {}
+        Ok(_) => { panic("invalid signal path accepted") }
+    }
+    match bus.receive(-1) { Err(_) => {}
+        Ok(_) => { panic("unbounded wait accepted") } }
+    match bus.request_name("org.tarn.DBusTest") { Err(failure) => {
+        if failure.name != "tarn.dbus.NameUnavailable" { panic("name conflict error") } }
+        Ok(_) => { panic("existing name stolen") } }
+    var args: Vec<string> = Vec.new()
+    args.push("org.freedesktop.DBus")
+    owner := try bus.call_strings("org.freedesktop.DBus", "/org/freedesktop/DBus", "org.freedesktop.DBus", "GetNameOwner", &args, 1000)
+    match owner.get(0) { dbus.Value.Text(name) => { if name != &"org.freedesktop.DBus" { panic("wrong bus owner") } }
+        _ => { panic("wrong GetNameOwner type") } }
+    typed_owner := try bus.name_owner("org.freedesktop.DBus")
+    if typed_owner != "org.freedesktop.DBus" { panic("typed owner helper") }
+    empty: Vec<string> := Vec.new()
+    mixed := try bus.call_strings("org.tarn.DBusTest", "/Test", "org.tarn.DBusTest", "Mixed", &empty, 1000)
+    if mixed.len() != 6 { panic("wrong mixed arity") }
+    match mixed.get(0) { dbus.Value.Text(text) => { if text != &"Tarn" { panic("text") } }
+        _ => { panic("text type") } }
+    match mixed.get(1) { dbus.Value.Bool(value) => { if !value { panic("boolean") } }
+        _ => { panic("boolean type") } }
+    match mixed.get(2) { dbus.Value.I32(value) => { if value != -42 { panic("negative int32") } }
+        _ => { panic("int32 type") } }
+    match mixed.get(3) { dbus.Value.U32(value) => { if value != 4294967295 { panic("uint32") } }
+        _ => { panic("uint32 type") } }
+    match mixed.get(4) { dbus.Value.U64(value) => { if value != 18446744073709551615 { panic("uint64") } }
+        _ => { panic("uint64 type") } }
+    match mixed.get(5) { dbus.Value.List(values) => { if values.len() != 2 { panic("string list") } }
+        _ => { panic("list type") } }
+    match bus.call_strings("org.tarn.DBusTest", "/Test", "org.tarn.DBusTest", "Huge", &empty, 1000) {
+        Err(failure) => { if failure.name != "tarn.dbus.LimitExceeded" { panic("reply limit error") } }
+        Ok(_) => { panic("reply value limit ignored") }
+    }
+    nested := try bus.call_strings("org.tarn.DBusTest", "/Test", "org.tarn.DBusTest", "Nested", &empty, 1000)
+    match nested.get(0) { dbus.Value.Tuple(fields) => { if fields.len() != 2 { panic("tuple fields") } }
+        _ => { panic("tuple type") } }
+    match nested.get(1) {
+        dbus.Value.List(entries) => {
+            match entries.get(0) {
+                dbus.Value.Entry(pair) => {
+                    match pair.get(1) {
+                        dbus.Value.Variant(values) => {
+                            match values.get(0) { dbus.Value.Bool(value) => { if !value { panic("nested bool") } }
+                                _ => { panic("variant content") } }
+                        }
+                        _ => { panic("variant type") }
+                    }
+                }
+                _ => { panic("dictionary entry type") }
+            }
+        }
+        _ => { panic("dictionary type") }
+    }
+    match bus.call_strings("org.tarn.DBusTest", "/Test", "org.tarn.DBusTest", "Empty", &empty, 1000) {
+        Ok(values) => { if values.len() != 0 { panic("empty reply") } }
+        Err(_) => { panic("empty reply failed") }
+    }
+    match bus.call_strings("org.tarn.DBusTest", "/Test", "org.tarn.DBusTest", "Unsupported", &empty, 1000) {
+        Err(failure) => { if failure.name != "tarn.dbus.UnsupportedType" { panic("unsupported error") } }
+        Ok(_) => { panic("unsupported type accepted") }
+    }
+    match bus.call_strings("org.tarn.DBusTest", "/Test", "org.tarn.DBusTest", "Missing", &empty, 1000) {
+        Err(failure) => { if failure.name != "org.freedesktop.DBus.Error.UnknownMethod" { panic("remote error name lost") } }
+        Ok(_) => { panic("missing method succeeded") }
+    }
+    match bus.call_strings("invalid name", "/Test", "org.tarn.DBusTest", "Mixed", &empty, 1000) {
+        Err(failure) => { if failure.name != "tarn.dbus.InvalidArgument" { panic("argument error") } }
+        Ok(_) => { panic("invalid name accepted") }
+    }
+    match bus.call_strings("org.tarn.DBusTest", "/Test", "org.tarn.DBusTest", "Mixed", &empty, 0) {
+        Err(_) => {}
+        Ok(_) => { panic("infinite timeout accepted") }
+    }
+    var nul: Vec<string> = Vec.new()
+    nul.push("before\0after")
+    match bus.call_strings("org.tarn.DBusTest", "/Test", "org.tarn.DBusTest", "Mixed", &nul, 1000) {
+        Err(failure) => { if failure.name != "tarn.dbus.InvalidArgument" { panic("NUL error") } }
+        Ok(_) => { panic("NUL accepted") }
+    }
+    match bus.call_strings("org.tarn.DBusTest", "/Test", "org.tarn.DBusTest", "Slow", &empty, 10) {
+        Err(failure) => { if failure.name != "org.freedesktop.DBus.Error.NoReply" { panic("timeout error") } }
+        Ok(_) => { panic("timeout ignored") }
+    }
+    return Ok(())
+}
+fn fail(bus &mut dbus.Connection) Result<void, dbus.Error> { return Err(dbus.Error{name: "test.EarlyReturn", message: "expected"}) }
+fn fd_count() usize {
+    match fs.read_dir("/proc/self/fd") { Ok(entries) => { return entries.len() }
+        Err(_) => { panic("cannot count descriptors")
+            } }
+}
+fn main() {
+    for i in 0..4 {
+        match dbus.with_session(check) { Ok(_) => {}
+            Err(failure) => { print(failure.name)
+                print(failure.message)
+                panic("client contract failed") } }
+    }
+    baseline := fd_count()
+    for i in 0..20 {
+        match dbus.with_session(fail) { Err(_) => {}
+            Ok(_) => { panic("callback error disappeared") } }
+    }
+    current := fd_count()
+    if current > baseline { panic("connection descriptors leaked on Err") }
+    print("PASS: ABI, calls, names, signals, bounded receive, errors and scoped cleanup")
+}

@@ -1,0 +1,15 @@
+import "src/dbus"
+import "os"
+fn inspect(bus &mut dbus.Connection) Result<void, dbus.Error> {
+    names := try bus.list_names()
+    for name in names.as_slice() { print(name) }
+    return Ok(())
+}
+fn main() {
+    match dbus.with_session(inspect) {
+        Ok(_) => {}
+        Err(error) => { print(error.name)
+            print(error.message)
+            os.exit(1) }
+    }
+}
