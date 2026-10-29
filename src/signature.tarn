@@ -1,0 +1,88 @@
+// D-Bus type signatures: validation and splitting into complete types.
+// Limits from the specification: 255 bytes, 32 nested arrays and 32 nested
+// structs (dict entries count as structs). Unix FDs ('h') are rejected because
+// this library does not pass descriptors.
+import "src/error"
+import "string"
+
+/// Basic type codes usable as dict keys: y b n q i u x t d s o g.
+pub fn is_basic(code u8) bool {
+    return code == 121 || code == 98 || code == 110 || code == 113 || code == 105 || code == 117 ||
+        code == 120 || code == 116 || code == 100 || code == 115 || code == 111 || code == 103
+}
+
+/// Wire alignment of the type starting with `code`.
+pub fn alignment(code u8) usize {
+    if code == 121 || code == 103 || code == 118 { return 1 }
+    if code == 110 || code == 113 { return 2 }
+    if code == 120 || code == 116 || code == 100 || code == 40 || code == 123 { return 8 }
+    return 4
+}
+
+// Returns the end index of the complete type starting at `start`.
+fn complete_end(bytes &[]u8, start usize, arrays u32, structs u32) Result<usize, error.Error> {
+    if start >= bytes.len() { return Err(error.invalid("Signature ends inside a type")) }
+    c := bytes[start]
+    if is_basic(c) || c == 118 { return Ok(start + 1) }
+    if c == 104 { return Err(error.unsupported("Unix file descriptors are not supported")) }
+    if c == 97 {
+        if arrays >= 32 { return Err(error.limit("More than 32 nested arrays")) }
+        next := start + 1
+        if next < bytes.len() && bytes[next] == 123 {
+            if structs >= 32 { return Err(error.limit("More than 32 nested structs")) }
+            if next + 1 >= bytes.len() || !is_basic(bytes[next + 1]) {
+                return Err(error.invalid("Dict entry key must be a basic type"))
+            }
+            value_end := try complete_end(bytes, next + 2, arrays + 1, structs + 1)
+            if value_end >= bytes.len() || bytes[value_end] != 125 {
+                return Err(error.invalid("Dict entry must have exactly a key and a value"))
+            }
+            return Ok(value_end + 1)
+        }
+        return complete_end(bytes, next, arrays + 1, structs)
+    }
+    if c == 40 {
+        if structs >= 32 { return Err(error.limit("More than 32 nested structs")) }
+        var index = start + 1
+        if index < bytes.len() && bytes[index] == 41 { return Err(error.invalid("Empty struct")) }
+        for {
+            if index >= bytes.len() { return Err(error.invalid("Unterminated struct")) }
+            if bytes[index] == 41 { return Ok(index + 1) }
+            index = try complete_end(bytes, index, arrays, structs + 1)
+        }
+    }
+    return Err(error.invalid("Unknown or misplaced type code in signature"))
+}
+
+/// End index of the complete type that starts at `start`, validating it.
+pub fn type_end(bytes &[]u8, start usize) Result<usize, error.Error> { return complete_end(bytes, start, 0, 0) }
+
+/// Splits a signature into its complete types; an empty signature is valid.
+pub fn split(signature &string) Result<Vec<string>, error.Error> {
+    bytes := signature.bytes()
+    if bytes.len() > 255 { return Err(error.limit("Signature longer than 255 bytes")) }
+    var types: Vec<string> = Vec.new()
+    var index: usize = 0
+    for index < bytes.len() {
+        end := try complete_end(bytes, index, 0, 0)
+        // ASCII-only signatures: byte ranges are always valid slices.
+        types.push(try string.slice(signature, index, end).ok_or(error.invalid("Signature is not ASCII")))
+        index = end
+    }
+    return Ok(types)
+}
+
+pub fn valid(signature &string) bool {
+    match split(signature) {
+        Ok(_) => { return true }
+        Err(_) => { return false }
+    }
+}
+
+/// True when `signature` is exactly one complete type.
+pub fn single(signature &string) bool {
+    match split(signature) {
+        Ok(types) => { return types.len() == 1 }
+        Err(_) => { return false }
+    }
+}

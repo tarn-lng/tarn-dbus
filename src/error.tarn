@@ -1,0 +1,10 @@
+// Owned D-Bus error shared by the native modules. Local errors use the
+// tarn.dbus.* namespace; remote error names are preserved verbatim.
+pub struct Error { pub name string
+    pub message string }
+
+pub fn new(name &string, message &string) Error { return Error{name: name.clone(), message: message.clone()} }
+pub fn invalid(message &string) Error { return new("tarn.dbus.InvalidArgument", message) }
+pub fn malformed(message &string) Error { return new("tarn.dbus.InvalidMessage", message) }
+pub fn limit(message &string) Error { return new("tarn.dbus.LimitExceeded", message) }
+pub fn unsupported(message &string) Error { return new("tarn.dbus.UnsupportedType", message) }

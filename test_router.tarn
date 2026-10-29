@@ -1,0 +1,154 @@
+// Serves test objects with the router until Quit; tests/run_router.py drives
+// it with GDBus, gdbus introspect and busctl on an isolated bus.
+import "src/connection"
+import "src/error"
+import "src/router"
+import "src/value"
+import "console"
+import "io"
+import "os"
+
+fn args(pairs &[]string) Vec<router.Arg> {
+    var out: Vec<router.Arg> = Vec.new()
+    var index: usize = 0
+    for index + 1 < pairs.len() {
+        out.push(router.arg(&pairs[index], &pairs[index + 1]))
+        index = index + 2
+    }
+    return out
+}
+
+fn calc() router.Interface {
+    return router.describe(&"org.tarn.Calc")
+        .method(&"Add", args(&[4]string{"a", "i", "b", "i"}), args(&[2]string{"sum", "i"}))
+        .method(&"Echo", args(&[2]string{"value", "v"}), args(&[2]string{"value", "v"}))
+        .method(&"Fail", Vec.new(), Vec.new())
+        .method(&"Twice", Vec.new(), Vec.new())
+        .method(&"Quit", Vec.new(), Vec.new())
+        .method(&"Bump", Vec.new(), Vec.new())
+        .method(&"Repaint", Vec.new(), Vec.new())
+        .signal(&"Done", args(&[2]string{"reason", "s"}))
+        .property(&"Title", &"s", &"readwrite")
+        .property(&"Count", &"u", &"read")
+        .property(&"Secret", &"s", &"write")
+        .property(&"Icon", &"ay", &"read")
+}
+
+fn serve(bus &mut connection.Connection) Result<void, error.Error> {
+    var routes = router.Router.new()
+    try routes.register(&"/org/tarn/Calc", calc())
+    try routes.register(&"/org/tarn/Calc/child", router.describe(&"org.tarn.Child")
+        .method(&"Hello", Vec.new(), args(&[2]string{"greeting", "s"})))
+    // Registration rules.
+    match routes.register(&"/org/tarn/Calc", calc()) { Ok(_) => { return Err(error.invalid("duplicate interface accepted")) }
+        Err(_) => {} }
+    match routes.register(&"/bad//path", calc()) { Ok(_) => { return Err(error.invalid("bad path accepted")) }
+        Err(_) => {} }
+    match routes.register(&"/x", router.describe(&"org.freedesktop.DBus.Properties")) {
+        Ok(_) => { return Err(error.invalid("standard interface accepted")) }
+        Err(_) => {} }
+    calc_path := "/org/tarn/Calc"
+    calc_iface := "org.tarn.Calc"
+    try routes.set_property(&calc_path, &calc_iface, &"Title", value.text(&"Inicial"))
+    try routes.set_property(&calc_path, &calc_iface, &"Count", value.Value.U32(0))
+    try routes.set_property(&calc_path, &calc_iface, &"Icon", value.Value.Bytes(Vec.new()))
+    // Property rules: undeclared names and wrong signatures are refused.
+    match routes.set_property(&calc_path, &calc_iface, &"Missing", value.Value.U32(1)) {
+        Ok(_) => { return Err(error.invalid("undeclared property accepted")) }
+        Err(_) => {} }
+    match routes.set_property(&calc_path, &calc_iface, &"Count", value.text(&"x")) {
+        Ok(_) => { return Err(error.invalid("wrong property type accepted")) }
+        Err(_) => {} }
+    if try routes.set_property(&calc_path, &calc_iface, &"Count", value.Value.U32(0)) {
+        return Err(error.invalid("equal value reported as a change"))
+    }
+    var count: u32 = 0
+    try bus.request_name(&"org.tarn.Server")
+    // Unbuffered: the driver waits for this line before calling.
+    var out = console.stdout()
+    try out.write_text(&"READY\n").map_err(fn(_failure io.Error) error.Error { return error.new("test.Output", "stdout") })
+    for {
+        match try bus.receive(5000) {
+            Some(incoming) => {
+                match try routes.route(bus, incoming) {
+                    router.Routed.Call(call) => {
+                        var current = call
+                        if current.member.eq(&"Add") {
+                            var sum: i32 = 0
+                            for item in current.args.as_slice() {
+                                match item { value.Value.I32(raw) => { sum = sum + raw }
+                                    _ => {} }
+                            }
+                            var body: Vec<value.Value> = Vec.new()
+                            body.push(value.Value.I32(sum))
+                            try current.reply(bus, body)
+                        } else if current.member.eq(&"Echo") {
+                            body := value.clone_all(current.args.as_slice())
+                            try current.reply(bus, body)
+                        } else if current.member.eq(&"Fail") {
+                            try current.fail(bus, &"org.tarn.Calc.Error.Nope", &"deliberate")
+                        } else if current.member.eq(&"Twice") {
+                            try current.reply(bus, Vec.new())
+                            match current.reply(bus, Vec.new()) { Ok(_) => { return Err(error.invalid("second reply accepted")) }
+                                Err(_) => {} }
+                        } else if current.member.eq(&"Bump") {
+                            // Two changes, one PropertiesChanged.
+                            count = count + 1
+                            try routes.set_property(&calc_path, &calc_iface, &"Count", value.Value.U32(count))
+                            try routes.set_property(&calc_path, &calc_iface, &"Title", value.text(&"Cambiado"))
+                            try routes.emit_changed(bus)
+                            try current.reply(bus, Vec.new())
+                        } else if current.member.eq(&"Repaint") {
+                            var pixels: Vec<u8> = Vec.new()
+                            pixels.push(255)
+                            try routes.set_property(&calc_path, &calc_iface, &"Icon", value.Value.Bytes(pixels))
+                            try routes.invalidate(&calc_path, &calc_iface, &"Icon")
+                            try routes.emit_changed(bus)
+                            try current.reply(bus, Vec.new())
+                        } else if current.member.eq(&"Set") {
+                            // Properties.Set reaches the app already checked; it may still refuse.
+                            var name = ""
+                            match current.args.get(1) { value.Value.Text(text) => { name = text.clone() }
+                                _ => {} }
+                            var wanted = value.text(&"")
+                            match current.args.get(2) { value.Value.Variant(held) => { wanted = held.inner.get(0).clone() }
+                                _ => {} }
+                            var refused = false
+                            match &wanted { value.Value.Text(text) => { refused = text.eq(&"rechazar") }
+                                _ => {} }
+                            if refused {
+                                try current.fail(bus, &"org.tarn.Calc.Error.Rejected", &"value refused")
+                            } else {
+                                if !name.eq(&"Secret") { try routes.set_property(&calc_path, &calc_iface, &name, wanted) }
+                                try current.reply(bus, Vec.new())
+                                try routes.emit_changed(bus)
+                            }
+                        } else if current.member.eq(&"Hello") {
+                            var body: Vec<value.Value> = Vec.new()
+                            body.push(value.text(&"hola"))
+                            try current.reply(bus, body)
+                        } else if current.member.eq(&"Quit") {
+                            try current.reply(bus, Vec.new())
+                            var reason: Vec<value.Value> = Vec.new()
+                            reason.push(value.text(&"quit"))
+                            try bus.signal(&"/org/tarn/Calc", &"org.tarn.Calc", &"Done", reason, &"")
+                            try bus.flush(2000)
+                            return Ok(())
+                        }
+                    }
+                    router.Routed.Handled => {}
+                    router.Routed.Other(_) => {}
+                }
+            }
+            None => { return Err(error.new("test.Timeout", "No client activity")) }
+        }
+    }
+}
+
+fn main() {
+    match connection.with_session(fn(bus &mut connection.Connection) Result<void, error.Error> { return serve(bus) }) {
+        Ok(_) => { print("SERVED") }
+        Err(e) => { print("ERROR " + e.name + ": " + e.message)
+            os.exit(1) }
+    }
+}

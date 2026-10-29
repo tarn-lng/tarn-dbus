@@ -1,0 +1,588 @@
+// Polling method dispatch for published objects. The application registers
+// interface descriptions, passes each received message to `route`, and
+// answers the returned Calls itself; no callbacks cross into the library.
+// The router answers Peer, Introspectable and every standard error.
+import "src/connection"
+import "src/error"
+import "src/marshal"
+import "src/message"
+import "src/names"
+import "src/signature"
+import "src/value"
+import "fs"
+import "string"
+
+pub struct Arg { pub name string
+    pub signature string }
+pub struct Method { pub name string
+    pub inputs Vec<Arg>
+    pub outputs Vec<Arg> }
+pub struct Signal { pub name string
+    pub args Vec<Arg> }
+/// Access: "read", "write" or "readwrite".
+pub struct Property { pub name string
+    pub signature string
+    pub access string }
+pub struct Interface { pub name string
+    pub methods Vec<Method>
+    pub signals Vec<Signal>
+    pub properties Vec<Property> }
+
+pub fn describe(name &string) Interface {
+    return Interface{name: name.clone(), methods: Vec.new(), signals: Vec.new(), properties: Vec.new()}
+}
+pub fn arg(name &string, sig &string) Arg { return Arg{name: name.clone(), signature: sig.clone()} }
+pub fn Interface.method(self, name &string, inputs Vec<Arg>, outputs Vec<Arg>) Interface {
+    var out = self
+    out.methods.push(Method{name: name.clone(), inputs: inputs, outputs: outputs})
+    return out
+}
+pub fn Interface.signal(self, name &string, args Vec<Arg>) Interface {
+    var out = self
+    out.signals.push(Signal{name: name.clone(), args: args})
+    return out
+}
+pub fn Interface.property(self, name &string, sig &string, access &string) Interface {
+    var out = self
+    out.properties.push(Property{name: name.clone(), signature: sig.clone(), access: access.clone()})
+    return out
+}
+
+fn joined(args &Vec<Arg>) string {
+    var out = ""
+    for item in args.as_slice() { out = out + item.signature.clone() }
+    return out
+}
+
+fn Interface.validate(&self) Result<void, error.Error> {
+    if !names.valid_interface(&self.name) { return Err(error.invalid("Invalid interface name")) }
+    if string.starts_with(&self.name, &"org.freedesktop.DBus.") {
+        return Err(error.invalid("Standard interfaces are provided by the router"))
+    }
+    for method in self.methods.as_slice() {
+        if !names.valid_member(&method.name) { return Err(error.invalid("Invalid method name")) }
+        if !signature.valid(&joined(&method.inputs)) || !signature.valid(&joined(&method.outputs)) {
+            return Err(error.invalid("Invalid method argument signature"))
+        }
+        for item in method.inputs.as_slice() { if !signature.single(&item.signature) { return Err(error.invalid("Each argument is one complete type")) } }
+        for item in method.outputs.as_slice() { if !signature.single(&item.signature) { return Err(error.invalid("Each argument is one complete type")) } }
+    }
+    for item in self.signals.as_slice() {
+        if !names.valid_member(&item.name) || !signature.valid(&joined(&item.args)) { return Err(error.invalid("Invalid signal")) }
+    }
+    for item in self.properties.as_slice() {
+        if !names.valid_member(&item.name) || !signature.single(&item.signature) { return Err(error.invalid("Invalid property")) }
+        if !item.access.eq(&"read") && !item.access.eq(&"write") && !item.access.eq(&"readwrite") {
+            return Err(error.invalid("Property access must be read, write or readwrite"))
+        }
+    }
+    return Ok(())
+}
+
+struct Object { path string
+    interfaces Vec<Interface> }
+
+// Current value of one property, plus whether it changed since the last
+// PropertiesChanged and whether it was invalidated instead of sent.
+struct Stored { path string
+    interface_name string
+    name string
+    current Vec<value.Value>
+    changed bool
+    invalidated bool }
+
+pub struct Router { objects Vec<Object>
+    values Vec<Stored> }
+pub fn Router.new() Router { return Router{objects: Vec.new(), values: Vec.new()} }
+
+/// Publishes `item` at `path`. One interface name per path.
+pub fn Router.register(&mut self, path &string, item Interface) Result<void, error.Error> {
+    if !names.valid_path(path) { return Err(error.invalid("Invalid object path")) }
+    try item.validate()
+    for object in self.objects.as_slice() {
+        if object.path.eq(path) {
+            for existing in object.interfaces.as_slice() {
+                if existing.name.eq(&item.name) { return Err(error.invalid("Interface already registered at this path")) }
+            }
+        }
+    }
+    var index: usize = 0
+    for index < self.objects.len() {
+        if self.objects.get(index).path.eq(path) {
+            self.objects.get_mut(index).interfaces.push(item)
+            return Ok(())
+        }
+        index = index + 1
+    }
+    var interfaces: Vec<Interface> = Vec.new()
+    interfaces.push(item)
+    self.objects.push(Object{path: path.clone(), interfaces: interfaces})
+    return Ok(())
+}
+
+/// Removes every interface published at `path`, and its property values.
+pub fn Router.unregister(&mut self, path &string) {
+    var stored: usize = 0
+    for stored < self.values.len() {
+        if self.values.get(stored).path.eq(path) { self.values.swap_remove(stored) } else { stored = stored + 1 }
+    }
+    var index: usize = 0
+    for index < self.objects.len() {
+        if self.objects.get(index).path.eq(path) {
+            self.objects.swap_remove(index)
+            return
+        }
+        index = index + 1
+    }
+}
+
+/// A method call for the application, already checked against the
+/// registered signature. Answer it with `reply` or `fail`, exactly once.
+pub struct Call { pub path string
+    pub interface_name string
+    pub member string
+    pub args Vec<value.Value>
+    pub request message.Message
+    answered bool }
+
+pub fn Call.reply(&mut self, bus &mut connection.Connection, body Vec<value.Value>) Result<void, error.Error> {
+    if self.answered { return Err(error.invalid("Call already answered")) }
+    self.answered = true
+    return bus.reply(&self.request, body)
+}
+pub fn Call.fail(&mut self, bus &mut connection.Connection, name &string, text &string) Result<void, error.Error> {
+    if self.answered { return Err(error.invalid("Call already answered")) }
+    self.answered = true
+    return bus.reply_error(&self.request, name, text)
+}
+pub fn Call.is_answered(&self) bool { return self.answered }
+
+pub enum Routed {
+    /// A call to a registered method, for the application to answer.
+    Call(Call)
+    /// The router answered it (standard interface or error).
+    Handled
+    /// Not a method call (signals, replies): returned unchanged.
+    Other(message.Message)
+}
+
+fn std_error(name &string) string { return "org.freedesktop.DBus.Error." + name.clone() }
+
+fn Router.find(&self, path &string) Option<&Object> {
+    for object in self.objects.as_slice() { if object.path.eq(path) { return Some(object) } }
+    return None
+}
+
+// Names of the direct children of `path` among registered objects.
+fn Router.children(&self, path &string) Vec<string> {
+    var prefix = path.clone()
+    if !prefix.eq(&"/") { prefix = prefix + "/" }
+    var out: Vec<string> = Vec.new()
+    for object in self.objects.as_slice() {
+        if string.starts_with(&object.path, &prefix) && !object.path.eq(path) {
+            rest := string.slice(&object.path, prefix.len(), object.path.len()).unwrap_or("")
+            var child = rest.clone()
+            match string.find(&rest, &"/") {
+                Some(end) => { child = string.slice(&rest, 0, end).unwrap_or("") }
+                None => {}
+            }
+            var seen = false
+            for name in out.as_slice() { if name.eq(&child) { seen = true } }
+            if !seen && !child.is_empty() { out.push(child) }
+        }
+    }
+    return out
+}
+
+fn escape(text &string) string {
+    var out: Vec<u8> = Vec.new()
+    for c in text.bytes() {
+        if c == 38 { out.extend_from_slice("&amp;".bytes())
+        } else if c == 60 { out.extend_from_slice("&lt;".bytes())
+        } else if c == 62 { out.extend_from_slice("&gt;".bytes())
+        } else if c == 34 { out.extend_from_slice("&quot;".bytes())
+        } else if c == 39 { out.extend_from_slice("&apos;".bytes())
+        } else { out.push(c) }
+    }
+    // Only ASCII bytes were replaced, so the result is still valid UTF-8.
+    return string.from_utf8(out.as_slice()).unwrap_or("")
+}
+
+fn args_xml(args &Vec<Arg>, direction &string) string {
+    var out = ""
+    for item in args.as_slice() {
+        out = out + "      <arg"
+        if !item.name.is_empty() { out = out + " name=\"" + escape(&item.name) + "\"" }
+        out = out + " type=\"" + escape(&item.signature) + "\""
+        if !direction.is_empty() { out = out + " direction=\"" + direction.clone() + "\"" }
+        out = out + "/>\n"
+    }
+    return out
+}
+
+fn standard_xml(properties bool) string {
+    var out = "  <interface name=\"org.freedesktop.DBus.Peer\">\n" +
+        "    <method name=\"Ping\"/>\n" +
+        "    <method name=\"GetMachineId\">\n      <arg name=\"machine_uuid\" type=\"s\" direction=\"out\"/>\n    </method>\n" +
+        "  </interface>\n" +
+        "  <interface name=\"org.freedesktop.DBus.Introspectable\">\n" +
+        "    <method name=\"Introspect\">\n      <arg name=\"xml_data\" type=\"s\" direction=\"out\"/>\n    </method>\n" +
+        "  </interface>\n"
+    if properties {
+        out = out + "  <interface name=\"org.freedesktop.DBus.Properties\">\n" +
+            "    <method name=\"Get\">\n      <arg name=\"interface_name\" type=\"s\" direction=\"in\"/>\n      <arg name=\"property_name\" type=\"s\" direction=\"in\"/>\n      <arg name=\"value\" type=\"v\" direction=\"out\"/>\n    </method>\n" +
+            "    <method name=\"GetAll\">\n      <arg name=\"interface_name\" type=\"s\" direction=\"in\"/>\n      <arg name=\"properties\" type=\"a{sv}\" direction=\"out\"/>\n    </method>\n" +
+            "    <method name=\"Set\">\n      <arg name=\"interface_name\" type=\"s\" direction=\"in\"/>\n      <arg name=\"property_name\" type=\"s\" direction=\"in\"/>\n      <arg name=\"value\" type=\"v\" direction=\"in\"/>\n    </method>\n" +
+            "    <signal name=\"PropertiesChanged\">\n      <arg name=\"interface_name\" type=\"s\"/>\n      <arg name=\"changed_properties\" type=\"a{sv}\"/>\n      <arg name=\"invalidated_properties\" type=\"as\"/>\n    </signal>\n" +
+            "  </interface>\n"
+    }
+    return out
+}
+
+/// Introspection XML for `path`: its interfaces plus direct child nodes.
+pub fn Router.introspect(&self, path &string) string {
+    var out = "<!DOCTYPE node PUBLIC \"-//freedesktop//DTD D-BUS Object Introspection 1.0//EN\"\n" +
+        " \"http://www.freedesktop.org/standards/dbus/1.0/introspect.dtd\">\n<node>\n"
+    var properties = false
+    located := self.find(path)
+    match located {
+        Some(object) => {
+            for item in object.interfaces.as_slice() { if !item.properties.is_empty() { properties = true } }
+            out = out + standard_xml(properties)
+            for item in object.interfaces.as_slice() {
+                out = out + "  <interface name=\"" + escape(&item.name) + "\">\n"
+                for method in item.methods.as_slice() {
+                    out = out + "    <method name=\"" + escape(&method.name) + "\">\n" +
+                        args_xml(&method.inputs, &"in") + args_xml(&method.outputs, &"out") + "    </method>\n"
+                }
+                for sig in item.signals.as_slice() {
+                    out = out + "    <signal name=\"" + escape(&sig.name) + "\">\n" + args_xml(&sig.args, &"") + "    </signal>\n"
+                }
+                for prop in item.properties.as_slice() {
+                    out = out + "    <property name=\"" + escape(&prop.name) + "\" type=\"" + escape(&prop.signature) +
+                        "\" access=\"" + prop.access.clone() + "\"/>\n"
+                }
+                out = out + "  </interface>\n"
+            }
+        }
+        None => { out = out + standard_xml(false) }
+    }
+    children := self.children(path)
+    for child in children.as_slice() { out = out + "  <node name=\"" + escape(child) + "\"/>\n" }
+    return out + "</node>\n"
+}
+
+fn machine_id() Result<string, error.Error> {
+    var paths: Vec<string> = Vec.new()
+    paths.push("/etc/machine-id")
+    paths.push("/var/lib/dbus/machine-id")
+    for path in paths.as_slice() {
+        match fs.read(path) {
+            Ok(raw) => {
+                text := string.trim(&string.from_utf8(raw.as_slice()).unwrap_or(""))
+                if text.len() == 32 { return Ok(text) }
+            }
+            Err(_) => {}
+        }
+    }
+    return Err(error.new(&std_error(&"FileNotFound"), "No machine id on this system"))
+}
+
+// The declared property, or the standard error name explaining its absence.
+fn Router.declared(&self, path &string, iface &string, name &string) Result<Property, error.Error> {
+    located := self.find(path)
+    match located {
+        None => { return Err(error.new(&std_error(&"UnknownObject"), &("No such object path: " + path.clone()))) }
+        Some(object) => {
+            for item in object.interfaces.as_slice() {
+                if !item.name.eq(iface) { continue }
+                for prop in item.properties.as_slice() {
+                    if prop.name.eq(name) {
+                        return Ok(Property{name: prop.name.clone(), signature: prop.signature.clone(), access: prop.access.clone()})
+                    }
+                }
+                return Err(error.new(&std_error(&"UnknownProperty"), &("No such property: " + name.clone())))
+            }
+            return Err(error.new(&std_error(&"UnknownInterface"), &("No such interface: " + iface.clone())))
+        }
+    }
+}
+
+fn same_value(left &value.Value, right &value.Value) bool {
+    if !left.signature().eq(&right.signature()) { return false }
+    var a: Vec<value.Value> = Vec.new()
+    a.push(left.clone())
+    var b: Vec<value.Value> = Vec.new()
+    b.push(right.clone())
+    match marshal.encode_body(a.as_slice()) {
+        Ok(first) => {
+            match marshal.encode_body(b.as_slice()) {
+                Ok(second) => {
+                    if first.len() != second.len() { return false }
+                    var index: usize = 0
+                    for index < first.len() {
+                        if first.get(index) != second.get(index) { return false }
+                        index = index + 1
+                    }
+                    return true
+                }
+                Err(_) => { return false }
+            }
+        }
+        Err(_) => { return false }
+    }
+}
+
+/// Sets a declared property's value, checked against its signature. Returns
+/// whether it changed; changes are announced by `emit_changed`. The first
+/// value of a property is not announced.
+pub fn Router.set_property(&mut self, path &string, iface &string, name &string, item value.Value) Result<bool, error.Error> {
+    prop := try self.declared(path, iface, name)
+    if !item.signature().eq(&prop.signature) {
+        return Err(error.invalid(&("Property " + name.clone() + " has signature " + prop.signature)))
+    }
+    try item.check()
+    var index: usize = 0
+    for index < self.values.len() {
+        current := self.values.get(index)
+        if current.path.eq(path) && current.interface_name.eq(iface) && current.name.eq(name) {
+            if same_value(current.current.get(0), &item) { return Ok(false) }
+            var held: Vec<value.Value> = Vec.new()
+            held.push(item)
+            slot := self.values.get_mut(index)
+            slot.current = held
+            slot.changed = true
+            slot.invalidated = false
+            return Ok(true)
+        }
+        index = index + 1
+    }
+    var held: Vec<value.Value> = Vec.new()
+    held.push(item)
+    // A first value is initialization, not a change clients could have seen.
+    self.values.push(Stored{path: path.clone(), interface_name: iface.clone(), name: name.clone(), current: held,
+        changed: false, invalidated: false})
+    return Ok(true)
+}
+
+/// Marks a property as changed without sending its value (for large or
+/// expensive values); clients fetch it with Get when they need it.
+pub fn Router.invalidate(&mut self, path &string, iface &string, name &string) Result<void, error.Error> {
+    try self.declared(path, iface, name)
+    var index: usize = 0
+    for index < self.values.len() {
+        slot := self.values.get_mut(index)
+        if slot.path.eq(path) && slot.interface_name.eq(iface) && slot.name.eq(name) {
+            slot.changed = true
+            slot.invalidated = true
+            return Ok(())
+        }
+        index = index + 1
+    }
+    return Err(error.invalid("Property has no value to invalidate"))
+}
+
+/// Current value of a property, if one was set.
+pub fn Router.property(&self, path &string, iface &string, name &string) Option<value.Value> {
+    for slot in self.values.as_slice() {
+        if slot.path.eq(path) && slot.interface_name.eq(iface) && slot.name.eq(name) { return Some(slot.current.get(0).clone()) }
+    }
+    return None
+}
+
+/// Sends one PropertiesChanged per object and interface with pending
+/// changes, batching every change made since the previous call.
+pub fn Router.emit_changed(&mut self, bus &mut connection.Connection) Result<void, error.Error> {
+    var sent: Vec<string> = Vec.new()
+    var index: usize = 0
+    for index < self.values.len() {
+        first := self.values.get(index)
+        key := first.path.clone() + "\n" + first.interface_name.clone()
+        var done = false
+        for seen in sent.as_slice() { if seen.eq(&key) { done = true } }
+        if first.changed && !done {
+            path := first.path.clone()
+            iface := first.interface_name.clone()
+            var changed = value.dict_sv()
+            var invalidated: Vec<value.Value> = Vec.new()
+            var scan: usize = 0
+            for scan < self.values.len() {
+                slot := self.values.get_mut(scan)
+                if slot.changed && slot.path.eq(&path) && slot.interface_name.eq(&iface) {
+                    if slot.invalidated { invalidated.push(value.text(&slot.name))
+                    } else { changed.put_sv(&slot.name, slot.current.get(0).clone()) }
+                    slot.changed = false
+                }
+                scan = scan + 1
+            }
+            var body: Vec<value.Value> = Vec.new()
+            body.push(value.text(&iface))
+            body.push(changed.done())
+            body.push(value.array(&"s", invalidated))
+            try bus.signal(&path, &"org.freedesktop.DBus.Properties", &"PropertiesChanged", body, &"")
+            sent.push(key)
+        }
+        index = index + 1
+    }
+    return Ok(())
+}
+
+fn readable(access &string) bool { return access.eq(&"read") || access.eq(&"readwrite") }
+
+// Get, GetAll and Set. Set is validated here and returned to the application.
+fn Router.properties(&self, bus &mut connection.Connection, incoming message.Message, body_sig &string) Result<Routed, error.Error> {
+    member := incoming.member.clone()
+    path := incoming.path.clone()
+    var texts: Vec<string> = Vec.new()
+    for item in incoming.body.as_slice() {
+        match item { value.Value.Text(s) => { texts.push(s.clone()) }
+            _ => {} }
+    }
+    if member.eq(&"Get") && body_sig.eq(&"ss") {
+        match self.declared(&path, texts.get(0), texts.get(1)) {
+            Err(e) => { try bus.reply_error(&incoming, &e.name, &e.message) }
+            Ok(prop) => {
+                if !readable(&prop.access) {
+                    try bus.reply_error(&incoming, &std_error(&"AccessDenied"), &("Property is write-only: " + prop.name))
+                } else {
+                    match self.property(&path, texts.get(0), texts.get(1)) {
+                        Some(current) => { try bus.reply(&incoming, one(value.variant(current))) }
+                        None => { try bus.reply_error(&incoming, &std_error(&"Failed"), &("Property has no value yet: " + prop.name)) }
+                    }
+                }
+            }
+        }
+        return Ok(Routed.Handled)
+    }
+    if member.eq(&"GetAll") && body_sig.eq(&"s") {
+        iface := texts.get(0).clone()
+        located := self.find(&path)
+        match located {
+            None => { try bus.reply_error(&incoming, &std_error(&"UnknownObject"), &("No such object path: " + path)) }
+            Some(object) => {
+                var all = value.dict_sv()
+                var found = iface.is_empty()
+                for item in object.interfaces.as_slice() {
+                    if !iface.is_empty() && !item.name.eq(&iface) { continue }
+                    found = true
+                    for prop in item.properties.as_slice() {
+                        if !readable(&prop.access) { continue }
+                        match self.property(&path, &item.name, &prop.name) {
+                            Some(current) => { all.put_sv(&prop.name, current) }
+                            None => {}
+                        }
+                    }
+                }
+                if found { try bus.reply(&incoming, one(all.done()))
+                } else { try bus.reply_error(&incoming, &std_error(&"UnknownInterface"), &("No such interface: " + iface)) }
+            }
+        }
+        return Ok(Routed.Handled)
+    }
+    if member.eq(&"Set") && body_sig.eq(&"ssv") {
+        match self.declared(&path, texts.get(0), texts.get(1)) {
+            Err(e) => { try bus.reply_error(&incoming, &e.name, &e.message) }
+            Ok(prop) => {
+                if prop.access.eq(&"read") {
+                    try bus.reply_error(&incoming, &std_error(&"PropertyReadOnly"), &("Property is read-only: " + prop.name))
+                    return Ok(Routed.Handled)
+                }
+                var wanted = ""
+                match incoming.body.get(2) { value.Value.Variant(held) => { wanted = held.signature.clone() }
+                    _ => {} }
+                if !wanted.eq(&prop.signature) {
+                    try bus.reply_error(&incoming, &std_error(&"InvalidArgs"), &("Property " + prop.name + " has signature " + prop.signature))
+                    return Ok(Routed.Handled)
+                }
+                args := value.clone_all(incoming.body.as_slice())
+                return Ok(Routed.Call(Call{path: path, interface_name: "org.freedesktop.DBus.Properties", member: member,
+                    args: args, request: incoming, answered: false}))
+            }
+        }
+        return Ok(Routed.Handled)
+    }
+    if member.eq(&"Get") || member.eq(&"GetAll") || member.eq(&"Set") {
+        try bus.reply_error(&incoming, &std_error(&"InvalidArgs"), &("Wrong arguments for Properties." + member))
+    } else {
+        try bus.reply_error(&incoming, &std_error(&"UnknownMethod"), &("No such Properties method: " + member))
+    }
+    return Ok(Routed.Handled)
+}
+
+fn one(item value.Value) Vec<value.Value> {
+    var out: Vec<value.Value> = Vec.new()
+    out.push(item)
+    return out
+}
+
+/// Routes one received message. Standard interfaces and errors are answered
+/// here; registered methods come back as `Routed.Call`.
+pub fn Router.route(&self, bus &mut connection.Connection, incoming message.Message) Result<Routed, error.Error> {
+    if incoming.kind != message.method_call() { return Ok(Routed.Other(incoming)) }
+    path := incoming.path.clone()
+    iface := incoming.interface_name.clone()
+    member := incoming.member.clone()
+    body_sig := value.signature_of(incoming.body.as_slice())
+    if iface.eq(&"org.freedesktop.DBus.Peer") {
+        if member.eq(&"Ping") && body_sig.is_empty() {
+            try bus.reply(&incoming, Vec.new())
+        } else if member.eq(&"GetMachineId") && body_sig.is_empty() {
+            match machine_id() {
+                Ok(id) => { try bus.reply(&incoming, one(value.text(&id))) }
+                Err(e) => { try bus.reply_error(&incoming, &e.name, &e.message) }
+            }
+        } else { try bus.reply_error(&incoming, &std_error(&"UnknownMethod"), &("No such Peer method: " + member)) }
+        return Ok(Routed.Handled)
+    }
+    known := self.find(&path).is_some()
+    if iface.eq(&"org.freedesktop.DBus.Introspectable") {
+        if !member.eq(&"Introspect") || !body_sig.is_empty() {
+            try bus.reply_error(&incoming, &std_error(&"UnknownMethod"), &("No such method: " + member))
+        } else if !known && self.children(&path).is_empty() && !path.eq(&"/") {
+            try bus.reply_error(&incoming, &std_error(&"UnknownObject"), &("No such object path: " + path))
+        } else {
+            try bus.reply(&incoming, one(value.text(&self.introspect(&path))))
+        }
+        return Ok(Routed.Handled)
+    }
+    if iface.eq(&"org.freedesktop.DBus.Properties") {
+        var offers = false
+        located_props := self.find(&path)
+        match located_props {
+            Some(object) => { for item in object.interfaces.as_slice() { if !item.properties.is_empty() { offers = true } } }
+            None => {}
+        }
+        if offers { return self.properties(bus, incoming, &body_sig) }
+    }
+    located := self.find(&path)
+    match located {
+        None => {
+            try bus.reply_error(&incoming, &std_error(&"UnknownObject"), &("No such object path: " + path))
+            return Ok(Routed.Handled)
+        }
+        Some(object) => {
+            var any_interface = false
+            for item in object.interfaces.as_slice() {
+                if !iface.is_empty() && !item.name.eq(&iface) { continue }
+                any_interface = true
+                for method in item.methods.as_slice() {
+                    if !method.name.eq(&member) { continue }
+                    if !body_sig.eq(&joined(&method.inputs)) {
+                        try bus.reply_error(&incoming, &std_error(&"InvalidArgs"),
+                            &("Expected signature '" + joined(&method.inputs) + "', got '" + body_sig + "'"))
+                        return Ok(Routed.Handled)
+                    }
+                    args := value.clone_all(incoming.body.as_slice())
+                    return Ok(Routed.Call(Call{path: path, interface_name: item.name.clone(), member: member, args: args,
+                        request: incoming, answered: false}))
+                }
+            }
+            if !any_interface || iface.eq(&"org.freedesktop.DBus.Properties") {
+                try bus.reply_error(&incoming, &std_error(&"UnknownInterface"), &("No such interface: " + iface))
+            } else {
+                try bus.reply_error(&incoming, &std_error(&"UnknownMethod"), &("No such method: " + member))
+            }
+            return Ok(Routed.Handled)
+        }
+    }
+}

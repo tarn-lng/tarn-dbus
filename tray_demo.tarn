@@ -1,0 +1,86 @@
+// Manual check on the real desktop: a tray icon with a menu. Left click or
+// "Saludar" sends a notification; "No molestar" toggles a checkbox and the
+// item status; "Salir" ends the program.
+import "desktop/dbusmenu"
+import "desktop/notifications"
+import "desktop/status_notifier"
+import "src/connection"
+import "src/error"
+import "os"
+import "string"
+
+fn menu(quiet bool, clicks u32) Vec<dbusmenu.Item> {
+    var out: Vec<dbusmenu.Item> = Vec.new()
+    out.push(dbusmenu.entry(1, &"Saludar").with_icon(&"face-smile"))
+    out.push(dbusmenu.entry(2, &("Clics: " + string.from_u64(u64(clicks)))).disabled())
+    out.push(dbusmenu.checkbox(3, &"No molestar", quiet))
+    out.push(dbusmenu.separator(4))
+    out.push(dbusmenu.entry(5, &"Salir").with_icon(&"application-exit"))
+    return out
+}
+
+fn greet(bus &mut connection.Connection, quiet bool, clicks u32) Result<void, error.Error> {
+    if quiet { return Ok(()) }
+    item := notifications.Notification.new(&"Tarn", &"Hola desde la bandeja")
+        .with_body(&("Clic número " + string.from_u64(u64(clicks)) + ", enviado con Tarn puro."))
+        .with_icon(&"face-smile")
+        .transient()
+    try notifications.notify(bus, &item, 2000)
+    return Ok(())
+}
+
+fn run(bus &mut connection.Connection) Result<void, error.Error> {
+    var quiet = false
+    var clicks: u32 = 0
+    var tray = try status_notifier.start(bus, &"tarn-demo", &"Tarn", &"applications-development", menu(quiet, clicks))
+    try tray.set_tooltip(bus, &"applications-development", &"Tarn", &"Clic para saludar; clic derecho para el menú")
+    if !tray.is_registered() {
+        print("No StatusNotifierWatcher on this session: the icon cannot be shown")
+        return Ok(())
+    }
+    print("Tray icon published as " + tray.service_name() + "; choose Salir in its menu to quit")
+    for {
+        match try bus.receive(60000) {
+            Some(incoming) => {
+                events := try tray.handle(bus, incoming)
+                for event in events.as_slice() {
+                    match event {
+                        status_notifier.Event.Activate(_) => {
+                            clicks = clicks + 1
+                            try greet(bus, quiet, clicks)
+                            try tray.set_menu(bus, menu(quiet, clicks))
+                        }
+                        status_notifier.Event.Menu(item) => {
+                            if item.kind.eq(&"clicked") {
+                                if item.id == 1 {
+                                    clicks = clicks + 1
+                                    try greet(bus, quiet, clicks)
+                                    try tray.set_menu(bus, menu(quiet, clicks))
+                                }
+                                if item.id == 3 {
+                                    quiet = !quiet
+                                    try tray.set_menu(bus, menu(quiet, clicks))
+                                    if quiet { try tray.set_status(bus, status_notifier.Status.Passive)
+                                    } else { try tray.set_status(bus, status_notifier.Status.Active) }
+                                }
+                                if item.id == 5 { return Ok(()) }
+                            }
+                        }
+                        status_notifier.Event.Registered => { print("Registered again after a Plasma restart") }
+                        status_notifier.Event.WatcherGone => { print("Watcher gone; waiting for it to return") }
+                        _ => {}
+                    }
+                }
+            }
+            None => {}
+        }
+    }
+}
+
+fn main() {
+    match connection.with_session(fn(bus &mut connection.Connection) Result<void, error.Error> { return run(bus) }) {
+        Ok(_) => { print("Bye") }
+        Err(e) => { print(e.name + ": " + e.message)
+            os.exit(1) }
+    }
+}

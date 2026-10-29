@@ -1,0 +1,243 @@
+// D-Bus messages: fixed header, header fields and body, with the per-type
+// field requirements of the specification. Encoding is little-endian.
+import "src/error"
+import "src/marshal"
+import "src/names"
+import "src/value"
+
+/// Message types on the wire.
+pub fn method_call() u8 { return 1 }
+pub fn method_return() u8 { return 2 }
+pub fn error_reply() u8 { return 3 }
+pub fn signal() u8 { return 4 }
+/// Header flags.
+pub fn no_reply_expected() u8 { return 1 }
+pub fn no_auto_start() u8 { return 2 }
+pub fn allow_interactive_authorization() u8 { return 4 }
+/// Largest whole message the specification allows (128 MiB).
+pub fn max_message() usize { return 134217728 }
+
+/// Owned message. Absent string fields are empty; absent reply_serial is 0.
+/// `signature` is derived from `body` when encoding.
+pub struct Message {
+    pub kind u8
+    pub flags u8
+    pub serial u32
+    pub path string
+    pub interface_name string
+    pub member string
+    pub error_name string
+    pub reply_serial u32
+    pub destination string
+    pub sender string
+    pub signature string
+    pub body Vec<value.Value>
+}
+
+fn empty(kind u8) Message {
+    return Message{kind: kind, flags: 0, serial: 0, path: "", interface_name: "", member: "", error_name: "",
+        reply_serial: 0, destination: "", sender: "", signature: "", body: Vec.new()}
+}
+pub fn call(destination &string, path &string, interface_name &string, member &string, body Vec<value.Value>) Message {
+    var out = empty(method_call())
+    out.destination = destination.clone()
+    out.path = path.clone()
+    out.interface_name = interface_name.clone()
+    out.member = member.clone()
+    out.body = body
+    return out
+}
+pub fn signal_message(path &string, interface_name &string, member &string, body Vec<value.Value>) Message {
+    var out = empty(signal())
+    out.path = path.clone()
+    out.interface_name = interface_name.clone()
+    out.member = member.clone()
+    out.body = body
+    return out
+}
+/// A method return addressed to the caller of `request`.
+pub fn reply_to(request &Message, body Vec<value.Value>) Message {
+    var out = empty(method_return())
+    out.reply_serial = request.serial
+    out.destination = request.sender.clone()
+    out.body = body
+    return out
+}
+pub fn error_to(request &Message, name &string, text &string) Message {
+    var out = empty(error_reply())
+    out.reply_serial = request.serial
+    out.destination = request.sender.clone()
+    out.error_name = name.clone()
+    var body: Vec<value.Value> = Vec.new()
+    body.push(value.text(text))
+    out.body = body
+    return out
+}
+
+fn optional(name &string, valid bool) Result<void, error.Error> {
+    if !name.is_empty() && !valid { return Err(error.invalid("Invalid header field value")) }
+    return Ok(())
+}
+
+/// Checks required fields per type and the validity of every present field.
+pub fn Message.validate(&self) Result<void, error.Error> {
+    if self.kind < 1 || self.kind > 4 { return Err(error.invalid("Unknown message type")) }
+    if self.serial == 0 { return Err(error.invalid("Serial must be non-zero")) }
+    try optional(&self.path, names.valid_path(&self.path))
+    try optional(&self.interface_name, names.valid_interface(&self.interface_name))
+    try optional(&self.member, names.valid_member(&self.member))
+    try optional(&self.error_name, names.valid_error_name(&self.error_name))
+    try optional(&self.destination, names.valid_bus_name(&self.destination))
+    try optional(&self.sender, names.valid_bus_name(&self.sender))
+    if self.path.eq(&"/org/freedesktop/DBus/Local") || self.interface_name.eq(&"org.freedesktop.DBus.Local") {
+        return Err(error.invalid("The Local path and interface are reserved"))
+    }
+    if self.kind == method_call() && (self.path.is_empty() || self.member.is_empty()) {
+        return Err(error.invalid("Method calls need a path and a member"))
+    }
+    if self.kind == signal() && (self.path.is_empty() || self.interface_name.is_empty() || self.member.is_empty()) {
+        return Err(error.invalid("Signals need a path, an interface and a member"))
+    }
+    if self.kind == error_reply() && self.error_name.is_empty() { return Err(error.invalid("Errors need an error name")) }
+    if (self.kind == method_return() || self.kind == error_reply()) && self.reply_serial == 0 {
+        return Err(error.invalid("Replies need a reply serial"))
+    }
+    return Ok(())
+}
+
+fn field(fields &mut Vec<value.Value>, code u8, item value.Value) {
+    var parts: Vec<value.Value> = Vec.new()
+    parts.push(value.Value.Byte(code))
+    parts.push(value.variant(item))
+    fields.push(value.structure(parts))
+}
+
+/// Encodes a validated message; `serial` must already be assigned.
+pub fn Message.encode(&self) Result<Vec<u8>, error.Error> {
+    try self.validate()
+    body := try marshal.encode_body(self.body.as_slice())
+    body_signature := value.signature_of(self.body.as_slice())
+    if !self.signature.is_empty() && !self.signature.eq(&body_signature) {
+        return Err(error.invalid("Declared signature does not match the body"))
+    }
+    var fields: Vec<value.Value> = Vec.new()
+    if !self.path.is_empty() { field(&mut fields, 1, value.path(&self.path)) }
+    if !self.interface_name.is_empty() { field(&mut fields, 2, value.text(&self.interface_name)) }
+    if !self.member.is_empty() { field(&mut fields, 3, value.text(&self.member)) }
+    if !self.error_name.is_empty() { field(&mut fields, 4, value.text(&self.error_name)) }
+    if self.reply_serial != 0 { field(&mut fields, 5, value.Value.U32(self.reply_serial)) }
+    if !self.destination.is_empty() { field(&mut fields, 6, value.text(&self.destination)) }
+    if !self.sender.is_empty() { field(&mut fields, 7, value.text(&self.sender)) }
+    if !body_signature.is_empty() { field(&mut fields, 8, value.Value.Sig(body_signature)) }
+    var out = marshal.Writer.new()
+    out.put_u8(108)
+    out.put_u8(self.kind)
+    out.put_u8(self.flags)
+    out.put_u8(1)
+    out.put_u32(u32(body.len()))
+    out.put_u32(self.serial)
+    try out.put(&value.array(&"(yv)", fields))
+    out.pad(8)
+    out.bytes.extend_from_slice(body.as_slice())
+    if out.bytes.len() > max_message() { return Err(error.limit("Message larger than 128 MiB")) }
+    return Ok(out.bytes)
+}
+
+fn read_u32_at(data &[]u8, at usize, big bool) u64 {
+    var raw: u64 = 0
+    var index: usize = 0
+    for index < 4 {
+        var shift = index * 8
+        if big { shift = (3 - index) * 8 }
+        raw = raw | (u64(data[at + index]) << u64(shift))
+        index = index + 1
+    }
+    return raw
+}
+
+/// Total size of the message whose first 16 bytes are `prefix`, so a stream
+/// reader knows how much to buffer. Rejects bad endianness, version and size.
+pub fn frame_length(prefix &[]u8) Result<usize, error.Error> {
+    if prefix.len() < 16 { return Err(error.malformed("Need 16 bytes to size a message")) }
+    if prefix[0] != 108 && prefix[0] != 66 { return Err(error.malformed("Unknown byte order")) }
+    if prefix[3] != 1 { return Err(error.malformed("Unsupported protocol version")) }
+    big := prefix[0] == 66
+    body := read_u32_at(prefix, 4, big)
+    fields := read_u32_at(prefix, 12, big)
+    if body > u64(max_message()) || fields > u64(max_message()) { return Err(error.limit("Message larger than 128 MiB")) }
+    var header = 16 + usize(fields)
+    for header % 8 != 0 { header = header + 1 }
+    total := header + usize(body)
+    if total > max_message() { return Err(error.limit("Message larger than 128 MiB")) }
+    return Ok(total)
+}
+
+fn text_field(item &value.Value) Result<string, error.Error> {
+    match item {
+        value.Value.Text(s) => { return Ok(s.clone()) }
+        value.Value.Path(s) => { return Ok(s.clone()) }
+        value.Value.Sig(s) => { return Ok(s.clone()) }
+        _ => { return Err(error.malformed("Header field has the wrong type")) }
+    }
+}
+
+/// Decodes exactly one complete message from `data`.
+pub fn decode(data &[]u8) Result<Message, error.Error> {
+    var cur = marshal.Cursor.new(false)
+    var out = try decode_header(data, &mut cur)
+    out.body = try marshal.decode_body(&data[cur.pos..], &out.signature, data[0] == 66)
+    return Ok(out)
+}
+
+/// Decodes and validates only the header, leaving `cur` at the body. Lets a
+/// reader fail one oversized or malformed body without losing the stream.
+pub fn decode_header(data &[]u8, cur &mut marshal.Cursor) Result<Message, error.Error> {
+    total := try frame_length(data)
+    if total != data.len() { return Err(error.malformed("Buffer is not exactly one message")) }
+    big := data[0] == 66
+    var out = empty(data[1])
+    out.flags = data[2]
+    out.serial = u32(read_u32_at(data, 8, big))
+    if out.kind < 1 || out.kind > 4 { return Err(error.malformed("Unknown message type")) }
+    *cur = marshal.Cursor.new(big)
+    cur.pos = 12
+    fields := try marshal.decode_values(data, cur, &"a(yv)")
+    match fields.get(0) {
+        value.Value.Array(list) => {
+            for entry in list.items.as_slice() {
+                match entry {
+                    value.Value.Struct(parts) => {
+                        var code: u8 = 0
+                        match parts.get(0) { value.Value.Byte(raw) => { code = raw }
+                            _ => {} }
+                        match parts.get(1) {
+                            value.Value.Variant(held) => {
+                                item := held.inner.get(0)
+                                expected := [9]string{"", "o", "s", "s", "s", "u", "s", "s", "g"}
+                                if code >= 1 && code <= 8 && !held.signature.eq(&expected[usize(code)]) {
+                                    return Err(error.malformed("Header field has the wrong type"))
+                                }
+                                if code == 1 { out.path = try text_field(item) }
+                                if code == 2 { out.interface_name = try text_field(item) }
+                                if code == 3 { out.member = try text_field(item) }
+                                if code == 4 { out.error_name = try text_field(item) }
+                                if code == 5 { match item { value.Value.U32(raw) => { out.reply_serial = raw }
+                                    _ => {} } }
+                                if code == 6 { out.destination = try text_field(item) }
+                                if code == 7 { out.sender = try text_field(item) }
+                                if code == 8 { out.signature = try text_field(item) }
+                                // Unknown field codes are ignored, as the specification requires.
+                            }
+                            _ => { return Err(error.malformed("Header field is not a variant")) }
+                        }
+                    }
+                    _ => { return Err(error.malformed("Header field is not a struct")) }
+                }
+            }
+        }
+        _ => { return Err(error.malformed("Header fields are not an array")) }
+    }
+    try marshal.align(data, cur, 8)
+    try out.validate()
+    return Ok(out)
+}

@@ -1,0 +1,415 @@
+// com.canonical.dbusmenu server: a tree of menu items with stable ids,
+// served through src/router. Updating the tree diffs it against the previous
+// one: structure changes send LayoutUpdated, property changes send
+// ItemsPropertiesUpdated. Spec binding only: actions are the app's.
+import "src/connection"
+import "src/error"
+import "src/router"
+import "src/value"
+
+pub fn menu_interface() string { return "com.canonical.dbusmenu" }
+
+/// One entry. `id` must be unique and positive (0 is the invisible root).
+/// toggle: "" none, "checkmark" or "radio"; checked is used only with a toggle.
+pub struct Item {
+    pub id i32
+    pub label string
+    pub enabled bool
+    pub visible bool
+    pub separator bool
+    pub toggle string
+    pub checked bool
+    pub icon_name string
+    pub children Vec<Item>
+}
+
+pub fn entry(id i32, label &string) Item {
+    return Item{id: id, label: label.clone(), enabled: true, visible: true, separator: false, toggle: "",
+        checked: false, icon_name: "", children: Vec.new()}
+}
+pub fn separator(id i32) Item {
+    var out = entry(id, &"")
+    out.separator = true
+    return out
+}
+pub fn checkbox(id i32, label &string, checked bool) Item {
+    var out = entry(id, label)
+    out.toggle = "checkmark"
+    out.checked = checked
+    return out
+}
+pub fn radio(id i32, label &string, checked bool) Item {
+    var out = entry(id, label)
+    out.toggle = "radio"
+    out.checked = checked
+    return out
+}
+pub fn Item.with_icon(self, name &string) Item {
+    var out = self
+    out.icon_name = name.clone()
+    return out
+}
+pub fn Item.disabled(self) Item {
+    var out = self
+    out.enabled = false
+    return out
+}
+pub fn Item.hidden(self) Item {
+    var out = self
+    out.visible = false
+    return out
+}
+pub fn Item.with_children(self, children Vec<Item>) Item {
+    var out = self
+    out.children = children
+    return out
+}
+
+pub fn Item.clone(&self) Item {
+    var children: Vec<Item> = Vec.new()
+    for child in self.children.as_slice() { children.push(child.clone()) }
+    return Item{id: self.id, label: self.label.clone(), enabled: self.enabled, visible: self.visible,
+        separator: self.separator, toggle: self.toggle.clone(), checked: self.checked, icon_name: self.icon_name.clone(),
+        children: children}
+}
+
+/// The spec's item properties. Defaults are omitted, as the spec requires.
+fn Item.properties(&self, wanted &Vec<string>) value.Dict {
+    var out = value.dict_sv()
+    var all: Vec<string> = Vec.new()
+    if !self.label.is_empty() && !self.separator { all.push("label") }
+    if !self.enabled { all.push("enabled") }
+    if !self.visible { all.push("visible") }
+    if self.separator { all.push("type") }
+    if !self.toggle.is_empty() { all.push("toggle-type")
+        all.push("toggle-state") }
+    if !self.icon_name.is_empty() { all.push("icon-name") }
+    if !self.children.is_empty() { all.push("children-display") }
+    for name in all.as_slice() {
+        var include = wanted.is_empty()
+        for asked in wanted.as_slice() { if asked.eq(name) { include = true } }
+        if !include { continue }
+        if name.eq(&"label") { out.put_sv(name, value.text(&self.label)) }
+        if name.eq(&"enabled") { out.put_sv(name, value.Value.Bool(self.enabled)) }
+        if name.eq(&"visible") { out.put_sv(name, value.Value.Bool(self.visible)) }
+        if name.eq(&"type") { out.put_sv(name, value.text(&"separator")) }
+        if name.eq(&"toggle-type") { out.put_sv(name, value.text(&self.toggle)) }
+        if name.eq(&"toggle-state") {
+            var state: i32 = 0
+            if self.checked { state = 1 }
+            out.put_sv(name, value.Value.I32(state))
+        }
+        if name.eq(&"icon-name") { out.put_sv(name, value.text(&self.icon_name)) }
+        if name.eq(&"children-display") { out.put_sv(name, value.text(&"submenu")) }
+    }
+    return out
+}
+
+// (ia{sv}av) for one node, children to `depth` levels (-1: all).
+fn Item.layout(&self, depth i32, wanted &Vec<string>) value.Value {
+    var children: Vec<value.Value> = Vec.new()
+    if depth != 0 {
+        for child in self.children.as_slice() { children.push(value.variant(child.layout(depth - 1, wanted))) }
+    }
+    var fields: Vec<value.Value> = Vec.new()
+    fields.push(value.Value.I32(self.id))
+    fields.push(self.properties(wanted).done())
+    fields.push(value.array(&"v", children))
+    return value.structure(fields)
+}
+
+fn Item.find(&self, id i32) Option<&Item> {
+    if self.id == id { return Some(self) }
+    for child in self.children.as_slice() {
+        found := child.find(id)
+        if found.is_some() { return found }
+    }
+    return None
+}
+
+// Ids in tree order with each parent id: the structure the diff compares.
+fn Item.shape(&self, parent i32, out &mut Vec<i32>) {
+    out.push(self.id)
+    out.push(parent)
+    for child in self.children.as_slice() { child.shape(self.id, out) }
+}
+fn Item.collect(&self, out &mut Vec<i32>) {
+    out.push(self.id)
+    for child in self.children.as_slice() { child.collect(out) }
+}
+
+fn same_props(left &Item, right &Item) bool {
+    return left.label.eq(&right.label) && left.enabled == right.enabled && left.visible == right.visible &&
+        left.separator == right.separator && left.toggle.eq(&right.toggle) && left.checked == right.checked &&
+        left.icon_name.eq(&right.icon_name) && left.children.is_empty() == right.children.is_empty()
+}
+
+/// Menu state served at one object path.
+pub struct Menu { pub path string
+    root Item
+    revision u32 }
+
+fn root_of(items Vec<Item>) Item { return entry(0, &"").with_children(items) }
+
+fn validate(root &Item) Result<void, error.Error> {
+    var ids: Vec<i32> = Vec.new()
+    root.collect(&mut ids)
+    if ids.len() > 1024 { return Err(error.limit("Menus are limited to 1024 items")) }
+    var index: usize = 1
+    for index < ids.len() {
+        id := ids.at(index)
+        if id <= 0 { return Err(error.invalid("Menu item ids must be positive")) }
+        var other = index + 1
+        for other < ids.len() {
+            if ids.at(other) == id { return Err(error.invalid("Menu item ids must be unique")) }
+            other = other + 1
+        }
+        index = index + 1
+    }
+    return Ok(())
+}
+
+fn args(pairs &[]string) Vec<router.Arg> {
+    var out: Vec<router.Arg> = Vec.new()
+    var index: usize = 0
+    for index + 1 < pairs.len() {
+        out.push(router.arg(&pairs[index], &pairs[index + 1]))
+        index = index + 2
+    }
+    return out
+}
+
+/// Interface description for router registration.
+pub fn description() router.Interface {
+    var out = router.describe(&menu_interface())
+    out = out.method(&"GetLayout", args(&[6]string{"parentId", "i", "recursionDepth", "i", "propertyNames", "as"}), args(&[4]string{"revision", "u", "layout", "(ia{sv}av)"}))
+    out = out.method(&"GetGroupProperties", args(&[4]string{"ids", "ai", "propertyNames", "as"}), args(&[2]string{"properties", "a(ia{sv})"}))
+    out = out.method(&"GetProperty", args(&[4]string{"id", "i", "name", "s"}), args(&[2]string{"value", "v"}))
+    out = out.method(&"Event", args(&[8]string{"id", "i", "eventId", "s", "data", "v", "timestamp", "u"}), Vec.new())
+    out = out.method(&"EventGroup", args(&[2]string{"events", "a(isvu)"}), args(&[2]string{"idErrors", "ai"}))
+    out = out.method(&"AboutToShow", args(&[2]string{"id", "i"}), args(&[2]string{"needUpdate", "b"}))
+    out = out.method(&"AboutToShowGroup", args(&[2]string{"ids", "ai"}), args(&[4]string{"updatesNeeded", "ai", "idErrors", "ai"}))
+    out = out.signal(&"ItemsPropertiesUpdated", args(&[4]string{"updatedProps", "a(ia{sv})", "removedProps", "a(ias)"}))
+    out = out.signal(&"LayoutUpdated", args(&[4]string{"revision", "u", "parent", "i"}))
+    out = out.signal(&"ItemActivationRequested", args(&[4]string{"id", "i", "timestamp", "u"}))
+    out = out.property(&"Version", &"u", &"read")
+    out = out.property(&"TextDirection", &"s", &"read")
+    out = out.property(&"Status", &"s", &"read")
+    out = out.property(&"IconThemePath", &"as", &"read")
+    return out
+}
+
+/// Registers the menu at `path` on `routes` with its spec properties.
+pub fn Menu.new(routes &mut router.Router, path &string, items Vec<Item>) Result<Menu, error.Error> {
+    root := root_of(items)
+    try validate(&root)
+    try routes.register(path, description())
+    iface := menu_interface()
+    try routes.set_property(path, &iface, &"Version", value.Value.U32(3))
+    try routes.set_property(path, &iface, &"TextDirection", value.text(&"ltr"))
+    try routes.set_property(path, &iface, &"Status", value.text(&"normal"))
+    try routes.set_property(path, &iface, &"IconThemePath", value.array(&"s", Vec.new()))
+    return Ok(Menu{path: path.clone(), root: root, revision: 1})
+}
+
+pub fn Menu.revision(&self) u32 { return self.revision }
+pub fn Menu.item(&self, id i32) Option<Item> {
+    match self.root.find(id) { Some(found) => { return Some(found.clone()) }
+        None => { return None } }
+}
+
+/// Replaces the menu and sends the minimal change signal.
+pub fn Menu.update(&mut self, bus &mut connection.Connection, items Vec<Item>) Result<void, error.Error> {
+    root := root_of(items)
+    try validate(&root)
+    var old_shape: Vec<i32> = Vec.new()
+    self.root.shape(-1, &mut old_shape)
+    var new_shape: Vec<i32> = Vec.new()
+    root.shape(-1, &mut new_shape)
+    var same_shape = old_shape.len() == new_shape.len()
+    var index: usize = 0
+    for same_shape && index < old_shape.len() {
+        if old_shape.get(index) != new_shape.get(index) { same_shape = false }
+        index = index + 1
+    }
+    if !same_shape {
+        self.root = root
+        self.revision = self.revision + 1
+        var body: Vec<value.Value> = Vec.new()
+        body.push(value.Value.U32(self.revision))
+        body.push(value.Value.I32(0))
+        return bus.signal(&self.path, &menu_interface(), &"LayoutUpdated", body, &"")
+    }
+    var updated: Vec<value.Value> = Vec.new()
+    var removed: Vec<value.Value> = Vec.new()
+    var ids: Vec<i32> = Vec.new()
+    root.collect(&mut ids)
+    every: Vec<string> := Vec.new()
+    for id in ids.as_slice() {
+        before := self.root.find(id)
+        after := root.find(id)
+        match before {
+            Some(old) => {
+                match after {
+                    Some(new) => {
+                        if !same_props(old, new) {
+                            // Send every current property, and name those that went back to defaults.
+                            var entry_fields: Vec<value.Value> = Vec.new()
+                            entry_fields.push(value.Value.I32(id))
+                            entry_fields.push(new.properties(&every).done())
+                            updated.push(value.structure(entry_fields))
+                            var gone: Vec<value.Value> = Vec.new()
+                            names := [8]string{"label", "enabled", "visible", "type", "toggle-type", "toggle-state", "icon-name", "children-display"}
+                            old_props := old.properties(&every)
+                            new_props := new.properties(&every)
+                            for name in &names {
+                                var had = false
+                                var has = false
+                                for item in old_props.entries.as_slice() { match &item.key { value.Value.Text(k) => { if k.eq(name) { had = true } }
+                                    _ => {} } }
+                                for item in new_props.entries.as_slice() { match &item.key { value.Value.Text(k) => { if k.eq(name) { has = true } }
+                                    _ => {} } }
+                                if had && !has { gone.push(value.text(name)) }
+                            }
+                            if !gone.is_empty() {
+                                var removal: Vec<value.Value> = Vec.new()
+                                removal.push(value.Value.I32(id))
+                                removal.push(value.array(&"s", gone))
+                                removed.push(value.structure(removal))
+                            }
+                        }
+                    }
+                    None => {}
+                }
+            }
+            None => {}
+        }
+    }
+    self.root = root
+    if updated.is_empty() { return Ok(()) }
+    var body: Vec<value.Value> = Vec.new()
+    body.push(value.array(&"(ia{sv})", updated))
+    body.push(value.array(&"(ias)", removed))
+    return bus.signal(&self.path, &menu_interface(), &"ItemsPropertiesUpdated", body, &"")
+}
+
+fn one(item value.Value) Vec<value.Value> {
+    var out: Vec<value.Value> = Vec.new()
+    out.push(item)
+    return out
+}
+fn int_of(item &value.Value) i32 {
+    match item { value.Value.I32(raw) => { return raw }
+        _ => { return 0 } }
+}
+fn text_of(item &value.Value) string {
+    match item { value.Value.Text(s) => { return s.clone() }
+        _ => { return "" } }
+}
+fn texts_of(item &value.Value) Vec<string> {
+    var out: Vec<string> = Vec.new()
+    match item {
+        value.Value.Array(list) => { for entry_value in list.items.as_slice() { out.push(text_of(entry_value)) } }
+        _ => {}
+    }
+    return out
+}
+fn ints_of(item &value.Value) Vec<i32> {
+    var out: Vec<i32> = Vec.new()
+    match item {
+        value.Value.Array(list) => { for entry_value in list.items.as_slice() { out.push(int_of(entry_value)) } }
+        _ => {}
+    }
+    return out
+}
+
+/// A user interaction for the application: "clicked" on an item, or
+/// "opened"/"closed" for a submenu (the spec's event ids).
+pub struct Event { pub id i32
+    pub kind string }
+
+/// Answers a routed call for this menu. Returns the menu events it carried.
+pub fn Menu.answer(&self, bus &mut connection.Connection, call &mut router.Call) Result<Vec<Event>, error.Error> {
+    var events: Vec<Event> = Vec.new()
+    member := call.member.clone()
+    if member.eq(&"GetLayout") {
+        parent := int_of(call.args.get(0))
+        depth := int_of(call.args.get(1))
+        wanted := texts_of(call.args.get(2))
+        match self.root.find(parent) {
+            Some(found) => {
+                var body: Vec<value.Value> = Vec.new()
+                body.push(value.Value.U32(self.revision))
+                body.push(found.layout(depth, &wanted))
+                try call.reply(bus, body)
+            }
+            None => { try call.fail(bus, &"org.freedesktop.DBus.Error.InvalidArgs", &"No such menu item") }
+        }
+    } else if member.eq(&"GetGroupProperties") {
+        wanted := texts_of(call.args.get(1))
+        var out: Vec<value.Value> = Vec.new()
+        for id in ints_of(call.args.get(0)).as_slice() {
+            match self.root.find(id) {
+                Some(found) => {
+                    var fields: Vec<value.Value> = Vec.new()
+                    fields.push(value.Value.I32(id))
+                    fields.push(found.properties(&wanted).done())
+                    out.push(value.structure(fields))
+                }
+                None => {}
+            }
+        }
+        try call.reply(bus, one(value.array(&"(ia{sv})", out)))
+    } else if member.eq(&"GetProperty") {
+        id := int_of(call.args.get(0))
+        var wanted: Vec<string> = Vec.new()
+        wanted.push(text_of(call.args.get(1)))
+        match self.root.find(id) {
+            Some(found) => {
+                props := found.properties(&wanted)
+                if props.entries.is_empty() {
+                    try call.fail(bus, &"org.freedesktop.DBus.Error.InvalidArgs", &"Property not set on this item")
+                } else {
+                    try call.reply(bus, one(props.entries.get(0).value.clone()))
+                }
+            }
+            None => { try call.fail(bus, &"org.freedesktop.DBus.Error.InvalidArgs", &"No such menu item") }
+        }
+    } else if member.eq(&"Event") {
+        id := int_of(call.args.get(0))
+        if self.root.find(id).is_some() { events.push(Event{id: id, kind: text_of(call.args.get(1))}) }
+        try call.reply(bus, Vec.new())
+    } else if member.eq(&"EventGroup") {
+        var errors: Vec<value.Value> = Vec.new()
+        match call.args.get(0) {
+            value.Value.Array(list) => {
+                for item in list.items.as_slice() {
+                    match item {
+                        value.Value.Struct(fields) => {
+                            id := int_of(fields.get(0))
+                            if self.root.find(id).is_some() { events.push(Event{id: id, kind: text_of(fields.get(1))})
+                            } else { errors.push(value.Value.I32(id)) }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            _ => {}
+        }
+        try call.reply(bus, one(value.array(&"i", errors)))
+    } else if member.eq(&"AboutToShow") {
+        try call.reply(bus, one(value.Value.Bool(false)))
+    } else if member.eq(&"AboutToShowGroup") {
+        var errors: Vec<value.Value> = Vec.new()
+        for id in ints_of(call.args.get(0)).as_slice() {
+            if self.root.find(id).is_none() { errors.push(value.Value.I32(id)) }
+        }
+        var body: Vec<value.Value> = Vec.new()
+        body.push(value.array(&"i", Vec.new()))
+        body.push(value.array(&"i", errors))
+        try call.reply(bus, body)
+    } else {
+        try call.fail(bus, &"org.freedesktop.DBus.Error.UnknownMethod", &"Unknown menu method")
+    }
+    return Ok(events)
+}

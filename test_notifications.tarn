@@ -1,0 +1,153 @@
+// Notifications binding against tests/notifications_fixture.py on an isolated bus.
+import "desktop/notifications"
+import "src/connection"
+import "src/error"
+import "src/marshal"
+import "src/message"
+import "src/value"
+import "encoding"
+import "os"
+import "string"
+
+struct Report { failures u32
+    checks u32 }
+fn Report.check(&mut self, passed bool, what &string) {
+    self.checks = self.checks + 1
+    if !passed {
+        self.failures = self.failures + 1
+        print("FAIL " + what.clone())
+    }
+}
+
+fn test_call(member &string, body Vec<value.Value>) message.Message {
+    return message.call(&"org.freedesktop.Notifications", &"/org/freedesktop/Notifications", &"org.tarn.NotifyTest", member, body)
+}
+
+// The arguments the server recorded for the last Notify, as encoded bytes.
+fn last_notify(bus &mut connection.Connection) Result<string, error.Error> {
+    reply := try bus.call(test_call(&"Last", Vec.new()), 2000)
+    match reply.body.get(0) {
+        value.Value.Variant(held) => {
+            match held.inner.get(0) {
+                value.Value.Struct(fields) => { return Ok(encoding.hex((try marshal.encode_body(fields.as_slice())).as_slice())) }
+                _ => {}
+            }
+        }
+        _ => {}
+    }
+    return Err(error.malformed("Last reply"))
+}
+
+fn expected_args() Result<string, error.Error> {
+    var actions: Vec<value.Value> = Vec.new()
+    actions.push(value.text(&"default"))
+    actions.push(value.text(&"Abrir"))
+    actions.push(value.text(&"later"))
+    actions.push(value.text(&"Más tarde"))
+    var hints = value.dict_sv()
+    hints.put_sv(&"urgency", value.Value.Byte(2))
+    hints.put_sv(&"desktop-entry", value.text(&"tarn-demo"))
+    hints.put_sv(&"resident", value.Value.Bool(true))
+    var out: Vec<value.Value> = Vec.new()
+    out.push(value.text(&"Tarn"))
+    out.push(value.Value.U32(0))
+    out.push(value.text(&"dialog-information"))
+    out.push(value.text(&"Hola desde Tarn"))
+    out.push(value.text(&"<b>Sin</b> libdbus"))
+    out.push(value.array(&"s", actions))
+    out.push(hints.done())
+    out.push(value.Value.I32(5000))
+    return Ok(encoding.hex((try marshal.encode_body(out.as_slice())).as_slice()))
+}
+
+fn next_event(bus &mut connection.Connection) Result<Option<notifications.Event>, error.Error> {
+    var tries = 0
+    for tries < 100 {
+        match try bus.receive(20) {
+            Some(item) => {
+                match notifications.event(&item) { Some(found) => { return Ok(Some(found)) }
+                    None => {} }
+            }
+            None => {}
+        }
+        tries = tries + 1
+    }
+    return Ok(None)
+}
+
+fn session(bus &mut connection.Connection, report &mut Report) Result<void, error.Error> {
+    info := try notifications.server_information(bus, 2000)
+    report.check(info.name.eq(&"Fixture") && info.spec_version.eq(&"1.2"), &"server information")
+    caps := try notifications.capabilities(bus, 2000)
+    report.check(caps.len() == 3 && caps.get(0).eq(&"actions"), &"capabilities")
+    try notifications.subscribe(bus)
+
+    // A repeated hint key replaces the earlier value.
+    item := notifications.Notification.new(&"Tarn", &"Hola desde Tarn")
+        .with_body(&"<b>Sin</b> libdbus")
+        .with_icon(&"dialog-information")
+        .with_action(&"default", &"Abrir")
+        .with_action(&"later", &"Más tarde")
+        .with_urgency(notifications.Urgency.Low)
+        .with_urgency(notifications.Urgency.Critical)
+        .with_desktop_entry(&"tarn-demo")
+        .resident()
+        .with_timeout(5000)
+    id := try notifications.notify(bus, &item, 2000)
+    report.check(id == 1, &"notify returns the id")
+    report.check((try last_notify(bus)).eq(&(try expected_args())), &"Notify arguments are exact")
+
+    replaced := try notifications.notify(bus, &notifications.Notification.new(&"Tarn", &"Actualizada").replacing(id), 2000)
+    report.check(replaced == id, &"replacing keeps the id")
+
+    // A click: the activation token arrives first, then the action.
+    var invoke: Vec<value.Value> = Vec.new()
+    invoke.push(value.Value.U32(id))
+    invoke.push(value.text(&"later"))
+    try bus.call(test_call(&"Invoke", invoke), 2000)
+    match try next_event(bus) {
+        Some(notifications.Event.ActivationToken(found)) => { report.check(found.id == id && found.text.eq(&"token-123"), &"activation token") }
+        _ => { report.check(false, &"activation token") }
+    }
+    match try next_event(bus) {
+        Some(notifications.Event.ActionInvoked(found)) => { report.check(found.id == id && found.text.eq(&"later"), &"action invoked") }
+        _ => { report.check(false, &"action invoked") }
+    }
+
+    // Dismissed by the user, then closed by the application.
+    var dismiss: Vec<value.Value> = Vec.new()
+    dismiss.push(value.Value.U32(id))
+    try bus.call(test_call(&"Dismiss", dismiss), 2000)
+    match try next_event(bus) {
+        Some(notifications.Event.Closed(found)) => {
+            match found.reason { notifications.CloseReason.Dismissed => { report.check(found.id == id, &"dismissed") }
+                _ => { report.check(false, &"dismissed reason") } }
+        }
+        _ => { report.check(false, &"dismissed") }
+    }
+    second := try notifications.notify(bus, &notifications.Notification.new(&"Tarn", &"Segunda"), 2000)
+    try notifications.close(bus, second, 2000)
+    match try next_event(bus) {
+        Some(notifications.Event.Closed(found)) => {
+            match found.reason { notifications.CloseReason.Closed => { report.check(found.id == second, &"closed by the app") }
+                _ => { report.check(false, &"closed reason") } }
+        }
+        _ => { report.check(false, &"closed by the app") }
+    }
+
+    // Unrelated signals are not notification events.
+    var other = message.signal_message(&"/x", &"org.x.Other", &"ActionInvoked", Vec.new())
+    other.serial = 1
+    report.check(notifications.event(&other).is_none(), &"foreign signal ignored")
+    return Ok(())
+}
+
+fn main() {
+    var report = Report{failures: 0, checks: 0}
+    match connection.with_session(fn(bus &mut connection.Connection) Result<void, error.Error> { return session(bus, &mut report) }) {
+        Ok(_) => {}
+        Err(e) => { report.check(false, &("session: " + e.name + ": " + e.message)) }
+    }
+    print("notification checks: " + string.from_u64(u64(report.checks)) + ", failures: " + string.from_u64(u64(report.failures)))
+    if report.failures != 0 { os.exit(1) }
+}
