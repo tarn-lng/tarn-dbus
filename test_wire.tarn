@@ -1,0 +1,370 @@
+// Offline wire-format tests: GDBus golden messages, round trips and hostile
+// input. Writes build/tarn-messages.txt for tests/golden/verify.py.
+import "src/error"
+import "src/marshal"
+import "src/message"
+import "src/signature"
+import "src/value"
+import "encoding"
+import "fs"
+import "os"
+import "string"
+
+struct Report { failures u32
+    checks u32 }
+fn Report.check(&mut self, passed bool, what &string) {
+    self.checks = self.checks + 1
+    if !passed {
+        self.failures = self.failures + 1
+        print("FAIL " + what.clone())
+    }
+}
+fn Report.rejects(&mut self, result Result<message.Message, error.Error>, name &string, what &string) {
+    match result {
+        Ok(_) => { self.check(false, &(what.clone() + ": accepted")) }
+        Err(e) => { self.check(e.name.eq(name), &(what.clone() + ": got " + e.name.clone())) }
+    }
+}
+
+fn nibble(c u8) u8 {
+    if c >= 97 { return c - 87 }
+    return c - 48
+}
+fn unhex(text &string) Vec<u8> {
+    bytes := text.bytes()
+    var out: Vec<u8> = Vec.new()
+    var index: usize = 0
+    for index + 1 < bytes.len() {
+        out.push(nibble(bytes[index]) * 16 + nibble(bytes[index + 1]))
+        index = index + 2
+    }
+    return out
+}
+
+fn text_array(items &[]string) value.Value {
+    var out: Vec<value.Value> = Vec.new()
+    for item in items { out.push(value.text(item)) }
+    return value.array(&"s", out)
+}
+fn pixels() Vec<u8> {
+    var out: Vec<u8> = Vec.new()
+    var index: u8 = 0
+    for index < 16 {
+        out.push(index)
+        index = index + 1
+    }
+    return out
+}
+
+// Tarn equivalents of tests/golden/cases.py bodies.
+fn body(name &string) Vec<value.Value> {
+    var out: Vec<value.Value> = Vec.new()
+    if name.eq(&"basic") {
+        out.push(value.Value.Byte(200))
+        out.push(value.Value.Bool(true))
+        out.push(value.Value.I16(-300))
+        out.push(value.Value.U16(65000))
+        out.push(value.Value.I32(-70000))
+        out.push(value.Value.U32(4000000000))
+        out.push(value.Value.I64(-5000000000000))
+        out.push(value.Value.U64(9223372036854775813))
+        out.push(value.Value.Double(3.14159))
+        out.push(value.text(&"héllo ✓"))
+        out.push(value.path(&"/org/x"))
+        out.push(value.Value.Sig("a{sv}"))
+    } else if name.eq(&"notify") || name.eq(&"notify_be") {
+        out.push(value.text(&"app"))
+        out.push(value.Value.U32(0))
+        out.push(value.text(&"icon"))
+        out.push(value.text(&"Sum"))
+        out.push(value.text(&"Body"))
+        out.push(text_array(&[2]string{"a", "Act"}))
+        var hints = value.dict_sv()
+        hints.put_sv(&"urgency", value.Value.Byte(1))
+        hints.put_sv(&"x", value.Value.I32(5))
+        hints.put_sv(&"desktop-entry", value.text(&"tarn"))
+        out.push(hints.done())
+        out.push(value.Value.I32(-1))
+    } else if name.eq(&"empty") {
+        out.push(value.array(&"s", Vec.new()))
+        out.push(value.dict_sv().done())
+        out.push(value.Value.Bytes(Vec.new()))
+        out.push(value.array(&"(ii)", Vec.new()))
+    } else if name.eq(&"pixmap") {
+        var icon: Vec<value.Value> = Vec.new()
+        icon.push(value.Value.I32(2))
+        icon.push(value.Value.I32(2))
+        icon.push(value.Value.Bytes(pixels()))
+        var icons: Vec<value.Value> = Vec.new()
+        icons.push(value.structure(icon))
+        out.push(value.array(&"(iiay)", icons))
+    } else if name.eq(&"nested") {
+        var map = value.dict_sv()
+        map.put_sv(&"k", text_array(&[2]string{"x", "y"}))
+        var inner: Vec<value.Value> = Vec.new()
+        inner.push(value.text(&"in"))
+        inner.push(map.done())
+        out.push(value.variant(value.variant(value.structure(inner))))
+    } else if name.eq(&"doubles") {
+        var zero: f64 = 0.0
+        out.push(value.Value.Double(zero))
+        out.push(value.Value.Double(-zero))
+        out.push(value.Value.Double(1e-310))
+        out.push(value.Value.Double(1.7976931348623157e308))
+        out.push(value.Value.Double(-1.5))
+    } else if name.eq(&"unsigned") {
+        out.push(value.Value.U16(65535))
+        out.push(value.Value.U32(4294967295))
+        out.push(value.Value.U64(18446744073709551615))
+    } else {
+        out.push(value.text(&"text"))
+    }
+    return out
+}
+
+// Tarn equivalents of the header fields in tests/golden/cases.py.
+fn expected(name &string) message.Message {
+    var out = message.call(&"", &"/", &"", &"", body(name))
+    if name.eq(&"basic") { out = message.call(&"org.x.Y", &"/a", &"org.x.I", &"M", body(name))
+        out.serial = 7 }
+    if name.eq(&"notify") || name.eq(&"notify_be") {
+        out = message.call(&"org.freedesktop.Notifications", &"/org/freedesktop/Notifications",
+            &"org.freedesktop.Notifications", &"Notify", body(name))
+        out.serial = 8
+        if name.eq(&"notify_be") { out.serial = 9 }
+    }
+    if name.eq(&"empty") { out = message.call(&":1.5", &"/", &"org.x.I", &"Empty", body(name))
+        out.flags = 1
+        out.serial = 10 }
+    if name.eq(&"pixmap") { out = message.call(&"", &"/StatusNotifierItem", &"org.x.I", &"Icon", body(name))
+        out.serial = 11 }
+    if name.eq(&"nested") { out = message.call(&"", &"/n", &"org.x.I", &"Nested", body(name))
+        out.serial = 12 }
+    if name.eq(&"doubles") { out = message.call(&"", &"/d", &"org.x.I", &"D", body(name))
+        out.serial = 13 }
+    if name.eq(&"unsigned") { out = message.call(&"", &"/u", &"org.x.I", &"U", body(name))
+        out.serial = 14 }
+    if name.eq(&"signal") { out = message.signal_message(&"/s", &"org.x.I", &"Changed", body(name))
+        out.serial = 15 }
+    if name.eq(&"error") || name.eq(&"reply") {
+        var request = message.call(&"", &"/", &"", &"M", Vec.new())
+        request.sender = ":1.9"
+        if name.eq(&"error") {
+            request.serial = 3
+            out = message.error_to(&request, &"org.x.Error.Failed", &"text")
+            out.serial = 16
+        } else {
+            request.serial = 4
+            out = message.reply_to(&request, body(name))
+            out.serial = 17
+        }
+    }
+    return out
+}
+
+fn same_header(got &message.Message, want &message.Message) bool {
+    return got.kind == want.kind && got.flags == want.flags && got.serial == want.serial &&
+        got.path.eq(&want.path) && got.interface_name.eq(&want.interface_name) && got.member.eq(&want.member) &&
+        got.error_name.eq(&want.error_name) && got.reply_serial == want.reply_serial &&
+        got.destination.eq(&want.destination) && got.signature.eq(&value.signature_of(want.body.as_slice()))
+}
+
+fn encoded_body(values &[]value.Value) Vec<u8> {
+    match marshal.encode_body(values) {
+        Ok(bytes) => { return bytes }
+        Err(e) => {
+            print("FAIL encode_body: " + e.message)
+            return Vec.new()
+        }
+    }
+}
+
+fn run_golden(report &mut Report, text &string) string {
+    var produced = ""
+    all := string.lines(text)
+    for line in all.as_slice() {
+        parts := string.split(line, &"|")
+        if parts.len() != 2 { continue }
+        name := parts.get(0)
+        data := unhex(parts.get(1))
+        want := expected(name)
+        want_body := encoded_body(want.body.as_slice())
+        big := data.as_slice()[0] == 66
+        if !big {
+            body_start := data.len() - want_body.len()
+            report.check(encoding.hex(&data.as_slice()[body_start..]).eq(&encoding.hex(want_body.as_slice())),
+                &(name.clone() + ": Tarn body bytes equal GDBus"))
+        }
+        match message.decode(data.as_slice()) {
+            Ok(got) => {
+                report.check(same_header(&got, &want), &(name.clone() + ": decoded header"))
+                report.check(encoding.hex(encoded_body(got.body.as_slice()).as_slice()).eq(&encoding.hex(want_body.as_slice())),
+                    &(name.clone() + ": decoded body"))
+            }
+            Err(e) => { report.check(false, &(name.clone() + ": decode " + e.message)) }
+        }
+        match want.encode() {
+            Ok(bytes) => { produced = produced + name.clone() + "|" + encoding.hex(bytes.as_slice()) + "\n" }
+            Err(e) => { report.check(false, &(name.clone() + ": encode " + e.message)) }
+        }
+    }
+    return produced
+}
+
+fn double_round_trips(report &mut Report) {
+    var zero: f64 = 0.0
+    samples := [10]f64{0.0, 1.0, -2.5, 0.1, 1e-310, 5e-324, 2.2250738585072014e-308, 1.7976931348623157e308, 123456789.125, -zero}
+    for sample in &samples {
+        var values: Vec<value.Value> = Vec.new()
+        values.push(value.Value.Double(sample))
+        bytes := encoded_body(values.as_slice())
+        match marshal.decode_body(bytes.as_slice(), &"d", false) {
+            Ok(back) => {
+                match back.get(0) {
+                    value.Value.Double(got) => {
+                        report.check(got == sample && (1.0 / got > 0.0) == (1.0 / sample > 0.0), &"double round trip")
+                    }
+                    _ => { report.check(false, &"double type") }
+                }
+            }
+            Err(e) => { report.check(false, &("double decode " + e.message)) }
+        }
+    }
+}
+
+// A 64x64 ARGB icon as used by StatusNotifierItem: a(iiay) with 16384 bytes.
+fn large_pixmap(report &mut Report) {
+    var data: Vec<u8> = Vec.new()
+    var index: usize = 0
+    for index < 16384 {
+        data.push(u8(index % 251))
+        index = index + 1
+    }
+    var icon: Vec<value.Value> = Vec.new()
+    icon.push(value.Value.I32(64))
+    icon.push(value.Value.I32(64))
+    icon.push(value.Value.Bytes(data))
+    var icons: Vec<value.Value> = Vec.new()
+    icons.push(value.structure(icon))
+    var values: Vec<value.Value> = Vec.new()
+    values.push(value.array(&"(iiay)", icons))
+    bytes := encoded_body(values.as_slice())
+    report.check(bytes.len() == 8 + 4 + 4 + 4 + 16384, &"64x64 pixmap size")
+    match marshal.decode_body(bytes.as_slice(), &"a(iiay)", false) {
+        Ok(back) => { report.check(encoding.hex(encoded_body(back.as_slice()).as_slice()).eq(&encoding.hex(bytes.as_slice())), &"64x64 pixmap round trip") }
+        Err(e) => { report.check(false, &("64x64 pixmap decode " + e.message)) }
+    }
+}
+
+fn signatures(report &mut Report) {
+    report.check(signature.valid(&"a{sv}(ia(iiay))as"), &"valid composite signature")
+    report.check(!signature.valid(&"a{vs}"), &"dict key must be basic")
+    report.check(!signature.valid(&"{sv}"), &"bare dict entry")
+    report.check(!signature.valid(&"a{svs}"), &"dict entry with three types")
+    report.check(!signature.valid(&"()"), &"empty struct")
+    report.check(!signature.valid(&"(i"), &"unterminated struct")
+    report.check(!signature.valid(&"h"), &"unix fd unsupported")
+    report.check(!signature.valid(&"z"), &"unknown code")
+    var deep = ""
+    var index = 0
+    for index < 33 {
+        deep = deep + "a"
+        index = index + 1
+    }
+    report.check(!signature.valid(&(deep + "i")), &"33 nested arrays")
+    report.check(signature.valid(&(string.slice(&deep, 0, 32).unwrap_or("") + "i")), &"32 nested arrays")
+}
+
+fn hostile(report &mut Report, sample &Vec<u8>) {
+    // Truncation at every length must fail cleanly.
+    var cut: usize = 0
+    var all_rejected = true
+    for cut < sample.len() {
+        match message.decode(&sample.as_slice()[0..cut]) {
+            Ok(_) => { all_rejected = false }
+            Err(_) => {}
+        }
+        cut = cut + 1
+    }
+    report.check(all_rejected, &"every truncation is rejected")
+    var order: Vec<u8> = Vec.new()
+    order.extend_from_slice(sample.as_slice())
+    order.replace(0, 120)
+    report.rejects(message.decode(order.as_slice()), &"tarn.dbus.InvalidMessage", &"unknown byte order")
+    var version: Vec<u8> = Vec.new()
+    version.extend_from_slice(sample.as_slice())
+    version.replace(3, 2)
+    report.rejects(message.decode(version.as_slice()), &"tarn.dbus.InvalidMessage", &"protocol version")
+    // Bodies: bad boolean, bad padding, invalid UTF-8, missing NUL, oversized array, nesting.
+    var boolean: Vec<u8> = Vec.new()
+    boolean.extend_from_slice(&[4]u8{2, 0, 0, 0})
+    report.check(!ok(marshal.decode_body(boolean.as_slice(), &"b", false)), &"boolean 2")
+    report.check(!ok(marshal.decode_body(&[8]u8{1, 7, 0, 0, 1, 0, 0, 0}, &"yu", false)), &"non-zero padding")
+    report.check(!ok(marshal.decode_body(&[7]u8{2, 0, 0, 0, 255, 254, 0}, &"s", false)), &"invalid UTF-8")
+    report.check(!ok(marshal.decode_body(&[7]u8{2, 0, 0, 0, 104, 105, 1}, &"s", false)), &"missing NUL")
+    report.check(!ok(marshal.decode_body(&[6]u8{1, 0, 0, 0, 0, 0}, &"s", false)), &"interior NUL")
+    report.check(!ok(marshal.decode_body(&[4]u8{255, 255, 255, 127}, &"ai", false)), &"array longer than buffer")
+    report.check(!ok(marshal.decode_body(&[8]u8{5, 0, 0, 0, 1, 0, 0, 0}, &"ay", false)), &"ay length past end")
+    report.check(!ok(marshal.decode_body(&[3]u8{1, 104, 0}, &"g", false)), &"invalid signature value")
+    report.check(!ok(marshal.decode_body(&[8]u8{2, 0, 0, 0, 47, 47, 0, 0}, &"o", false)), &"invalid object path")
+    report.check(!ok(marshal.decode_body(&[2]u8{1, 0}, &"y", false)), &"trailing bytes")
+    // A variant nested 70 times exceeds the 64-container limit.
+    var nested: Vec<u8> = Vec.new()
+    var depth = 0
+    for depth < 70 {
+        nested.extend_from_slice(&[3]u8{1, 118, 0})
+        depth = depth + 1
+    }
+    nested.extend_from_slice(&[3]u8{1, 121, 0})
+    nested.push(9)
+    report.check(!ok(marshal.decode_body(nested.as_slice(), &"v", false)), &"variant nesting limit")
+    // Encoding refuses values that break the rules.
+    var bad: Vec<value.Value> = Vec.new()
+    bad.push(value.path(&"not/a/path"))
+    report.check(!ok_bytes(marshal.encode_body(bad.as_slice())), &"encode invalid path")
+    var mixed: Vec<value.Value> = Vec.new()
+    mixed.push(value.Value.I32(1))
+    var wrong: Vec<value.Value> = Vec.new()
+    wrong.push(value.array(&"s", mixed))
+    report.check(!ok_bytes(marshal.encode_body(wrong.as_slice())), &"encode array with wrong element type")
+    var nul: Vec<value.Value> = Vec.new()
+    nul.push(value.Value.Text(string.from_utf8(&[3]u8{104, 0, 105}).unwrap_or("")))
+    report.check(!ok_bytes(marshal.encode_body(nul.as_slice())), &"encode string with NUL")
+    var missing = message.call(&"org.x.Y", &"/a", &"org.x.I", &"M", Vec.new())
+    report.check(!ok_bytes(missing.encode()), &"encode without serial")
+    var no_member = message.signal_message(&"/a", &"org.x.I", &"", Vec.new())
+    no_member.serial = 1
+    report.check(!ok_bytes(no_member.encode()), &"signal without member")
+}
+
+fn ok(result Result<Vec<value.Value>, error.Error>) bool {
+    match result { Ok(_) => { return true }
+        Err(_) => { return false } }
+}
+fn ok_bytes(result Result<Vec<u8>, error.Error>) bool {
+    match result { Ok(_) => { return true }
+        Err(_) => { return false } }
+}
+
+fn main() {
+    var report = Report{failures: 0, checks: 0}
+    signatures(&mut report)
+    double_round_trips(&mut report)
+    large_pixmap(&mut report)
+    match fs.read(&"tests/golden/messages.txt") {
+        Ok(raw) => {
+            text := string.from_utf8(raw.as_slice()).unwrap_or("")
+            produced := run_golden(&mut report, &text)
+            match fs.write_text(&"build/tarn-messages.txt", &produced) {
+                Ok(_) => {}
+                Err(_) => { report.check(false, &"write build/tarn-messages.txt") }
+            }
+            first := string.lines(&text)
+            parts := string.split(first.get(0), &"|")
+            hostile(&mut report, &unhex(parts.get(1)))
+        }
+        Err(_) => { report.check(false, &"read tests/golden/messages.txt") }
+    }
+    print("wire checks: " + string.from_u64(u64(report.checks)) + ", failures: " + string.from_u64(u64(report.failures)))
+    if report.failures != 0 { os.exit(1) }
+}

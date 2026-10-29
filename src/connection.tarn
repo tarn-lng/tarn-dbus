@@ -1,0 +1,595 @@
+// Native session-bus connection over a Unix stream: address resolution, SASL
+// EXTERNAL authentication, Hello, bounded queues, blocking and non-blocking
+// calls, and typed signals. No libdbus, no FFI, no unsafe.
+import "src/error"
+import "src/marshal"
+import "src/message"
+import "src/names"
+import "src/value"
+import "encoding"
+import "fs"
+import "io"
+import "net"
+import "os"
+import "string"
+import "time"
+
+/// Messages kept in the inbox before reading pauses (backpressure).
+pub fn max_inbox() usize { return 4096 }
+/// Bytes queued for writing before `send` refuses more.
+pub fn max_outbox() usize { return 16777216 }
+
+struct Pending { serial u32
+    deadline u64 }
+
+/// Scoped connection. Obtainable only inside `with_session`; not transferable.
+pub struct Connection {
+    stream net.UnixStream
+    poll net.Poll
+    token net.Token
+    started time.Instant
+    serial u32
+    unique string
+    input Vec<u8>
+    output Vec<u8>
+    inbox Vec<message.Message>
+    pending Vec<Pending>
+    expired Vec<u32>
+    scratch Vec<u8>
+    closed bool
+}
+
+fn zeros(size usize) Vec<u8> {
+    var out: Vec<u8> = Vec.with_capacity(size)
+    for out.len() < size { out.push(0) }
+    return out
+}
+
+fn io_failure(context &string, failure io.Error) error.Error {
+    var kind = "tarn.dbus.TransportError"
+    match failure.kind {
+        io.ErrorKind.NotFound => { kind = "tarn.dbus.NoBus" }
+        io.ErrorKind.PermissionDenied => { kind = "tarn.dbus.AccessDenied" }
+        _ => {}
+    }
+    return error.new(&kind, &(context.clone() + " (errno " + string.from_i64(i64(failure.native_code())) + ")"))
+}
+fn disconnected() error.Error { return error.new("tarn.dbus.Disconnected", "Session bus disconnected") }
+fn timed_out() error.Error { return error.new("org.freedesktop.DBus.Error.NoReply", "No reply within the timeout") }
+
+fn hex_value(c u8) Option<u8> {
+    if c >= 48 && c <= 57 { return Some(c - 48) }
+    if c >= 97 && c <= 102 { return Some(c - 87) }
+    if c >= 65 && c <= 70 { return Some(c - 55) }
+    return None
+}
+// D-Bus address values escape bytes as %XX.
+fn unescape(text &string) Result<string, error.Error> {
+    bytes := text.bytes()
+    var out: Vec<u8> = Vec.new()
+    var index: usize = 0
+    for index < bytes.len() {
+        if bytes[index] == 37 {
+            if index + 2 >= bytes.len() { return Err(error.invalid("Truncated %XX escape in bus address")) }
+            high := try hex_value(bytes[index + 1]).ok_or(error.invalid("Bad %XX escape in bus address"))
+            low := try hex_value(bytes[index + 2]).ok_or(error.invalid("Bad %XX escape in bus address"))
+            out.push(high * 16 + low)
+            index = index + 3
+        } else {
+            out.push(bytes[index])
+            index = index + 1
+        }
+    }
+    return string.from_utf8(out.as_slice()).ok_or(error.invalid("Bus address is not UTF-8"))
+}
+
+/// The socket path of the first usable `unix:path=` entry. Abstract sockets
+/// and other transports are skipped; none usable is UnsupportedAddress.
+pub fn socket_path(address &string) Result<string, error.Error> {
+    var skipped = false
+    entries := string.split(address, &";")
+    for entry in entries.as_slice() {
+        if !string.starts_with(entry, &"unix:") { if !entry.is_empty() { skipped = true }
+            continue }
+        rest := try string.slice(entry, 5, entry.len()).ok_or(error.invalid("Bad bus address"))
+        pairs := string.split(&rest, &",")
+        for pair in pairs.as_slice() {
+            if string.starts_with(pair, &"path=") {
+                return unescape(&(try string.slice(pair, 5, pair.len()).ok_or(error.invalid("Bad bus address"))))
+            }
+        }
+        skipped = true
+    }
+    if skipped { return Err(error.new("tarn.dbus.UnsupportedAddress", "Only unix:path= bus addresses are supported")) }
+    return Err(error.invalid("Empty bus address"))
+}
+
+/// DBUS_SESSION_BUS_ADDRESS, or $XDG_RUNTIME_DIR/bus as the systemd default.
+pub fn session_path() Result<string, error.Error> {
+    match os.env(&"DBUS_SESSION_BUS_ADDRESS") {
+        Ok(Some(address)) => { if !address.is_empty() { return socket_path(&address) } }
+        _ => {}
+    }
+    match os.env(&"XDG_RUNTIME_DIR") {
+        Ok(Some(dir)) => { if !dir.is_empty() { return Ok(dir + "/bus") } }
+        _ => {}
+    }
+    return Err(error.new("tarn.dbus.NoBus", "No session bus address in the environment"))
+}
+
+/// Real uid of this process, from /proc/self/status (first `Uid:` field).
+pub fn current_uid() Result<string, error.Error> {
+    raw := try fs.read(&"/proc/self/status").map_err(fn(failure io.Error) error.Error { return io_failure("Cannot read /proc/self/status", failure) })
+    text := try string.from_utf8(raw.as_slice()).ok_or(error.invalid("Unreadable /proc/self/status"))
+    lines := string.lines(&text)
+    for line in lines.as_slice() {
+        if string.starts_with(line, &"Uid:") {
+            fields := string.fields(line)
+            if fields.len() >= 2 { return Ok(fields.get(1).clone()) }
+        }
+    }
+    return Err(error.new("tarn.dbus.AuthFailed", "No Uid line in /proc/self/status"))
+}
+
+fn Connection.now(&self) Result<u64, error.Error> {
+    elapsed := try self.started.elapsed().map_err(fn(failure io.Error) error.Error { return io_failure("Clock failed", failure) })
+    return Ok(elapsed.as_millis())
+}
+
+// Waits up to `timeout_ms` for readiness, then moves bytes in both directions.
+// Returns false when nothing was ready.
+fn Connection.pump(&mut self, timeout_ms i32) Result<bool, error.Error> {
+    if self.closed { return Err(disconnected()) }
+    var interest = net.Interest.Readable
+    if !self.output.is_empty() { interest = net.Interest.ReadableWritable }
+    // Backpressure: stop reading while the inbox is full.
+    if self.inbox.len() >= max_inbox() {
+        if self.output.is_empty() { return Err(error.limit("Inbox full: dispatch messages before receiving more")) }
+        interest = net.Interest.Writable
+    }
+    try self.poll.modify_unix(&self.stream, self.token, interest).map_err(fn(failure io.Error) error.Error { return io_failure("poll modify", failure) })
+    var events = [1]net.Event{net.Event.empty()}
+    ready := try self.poll.wait(&mut events, timeout_ms).map_err(fn(failure io.Error) error.Error { return io_failure("poll wait", failure) })
+    if ready == 0 { return Ok(false) }
+    event := events[0]
+    if event.writable || !self.output.is_empty() { try self.write_some() }
+    if event.readable || event.hangup || event.error { try self.read_some() }
+    return Ok(true)
+}
+
+fn Connection.write_some(&mut self) Result<void, error.Error> {
+    for !self.output.is_empty() {
+        match self.stream.write(self.output.as_slice()) {
+            Ok(count) => {
+                if count == 0 { return Ok(()) }
+                var rest: Vec<u8> = Vec.new()
+                rest.extend_from_slice(&self.output.as_slice()[count..])
+                self.output = rest
+            }
+            Err(failure) => {
+                match failure.kind {
+                    io.ErrorKind.WouldBlock => { return Ok(()) }
+                    _ => {
+                        self.closed = true
+                        return Err(io_failure("Write to bus failed", failure))
+                    }
+                }
+            }
+        }
+    }
+    return Ok(())
+}
+
+fn Connection.read_some(&mut self) Result<void, error.Error> {
+    for self.inbox.len() < max_inbox() {
+        match self.stream.read(self.scratch.as_mut_slice()) {
+            Ok(count) => {
+                if count == 0 {
+                    self.closed = true
+                    return Err(disconnected())
+                }
+                self.input.extend_from_slice(&self.scratch.as_slice()[0..count])
+                try self.frame()
+            }
+            Err(failure) => {
+                match failure.kind {
+                    io.ErrorKind.WouldBlock => { return Ok(()) }
+                    _ => {
+                        self.closed = true
+                        return Err(io_failure("Read from bus failed", failure))
+                    }
+                }
+            }
+        }
+    }
+    return Ok(())
+}
+
+// Moves every complete message from the input buffer into the inbox.
+fn Connection.frame(&mut self) Result<void, error.Error> {
+    var offset: usize = 0
+    for self.input.len() - offset >= 16 {
+        total := try message.frame_length(&self.input.as_slice()[offset..offset + 16])
+        if self.input.len() - offset < total { break }
+        frame := &self.input.as_slice()[offset..offset + total]
+        match message.decode(frame) {
+            Ok(decoded) => {
+                if !self.late(decoded.reply_serial) {
+                    self.complete(decoded.reply_serial)
+                    self.inbox.push(decoded)
+                }
+            }
+            Err(failure) => {
+                // A bad header breaks the protocol; a bad body only fails its reply.
+                var cur = marshal.Cursor.new(false)
+                header := try message.decode_header(frame, &mut cur)
+                if header.reply_serial != 0 {
+                    var request = message.call(&"", &"/", &"", &"Failed", Vec.new())
+                    request.serial = header.reply_serial
+                    var local = message.error_to(&request, &failure.name, &failure.message)
+                    local.destination = self.unique.clone()
+                    self.complete(header.reply_serial)
+                    self.inbox.push(local)
+                }
+            }
+        }
+        offset = offset + total
+    }
+    if offset > 0 {
+        var rest: Vec<u8> = Vec.new()
+        rest.extend_from_slice(&self.input.as_slice()[offset..])
+        self.input = rest
+    }
+    return Ok(())
+}
+
+// Removes the message at `index`, keeping the order of the others.
+fn take(queue &mut Vec<message.Message>, index usize) Option<message.Message> {
+    var tail: Vec<message.Message> = Vec.new()
+    for queue.len() > index + 1 {
+        match queue.pop() { Some(item) => { tail.push(item) }
+            None => {} }
+    }
+    found := queue.pop()
+    for !tail.is_empty() {
+        match tail.pop() { Some(item) => { queue.push(item) }
+            None => {} }
+    }
+    return found
+}
+
+// True for a reply whose call already expired locally.
+fn Connection.late(&mut self, reply_serial u32) bool {
+    if reply_serial == 0 { return false }
+    var index: usize = 0
+    for index < self.expired.len() {
+        if self.expired.get(index) == &reply_serial {
+            self.expired.swap_remove(index)
+            return true
+        }
+        index = index + 1
+    }
+    return false
+}
+
+fn Connection.complete(&mut self, reply_serial u32) {
+    if reply_serial == 0 { return }
+    var index: usize = 0
+    for index < self.pending.len() {
+        if self.pending.get(index).serial == reply_serial {
+            self.pending.swap_remove(index)
+            return
+        }
+        index = index + 1
+    }
+}
+
+/// Assigns the next serial, encodes and queues the message, and writes what
+/// the socket accepts now. Returns the serial.
+pub fn Connection.send(&mut self, outgoing message.Message) Result<u32, error.Error> {
+    if self.closed { return Err(disconnected()) }
+    var item = outgoing
+    if self.serial == 4294967295 { self.serial = 0 }
+    self.serial = self.serial + 1
+    item.serial = self.serial
+    item.sender = ""
+    bytes := try item.encode()
+    if self.output.len() + bytes.len() > max_outbox() { return Err(error.limit("Outgoing queue full")) }
+    self.output.extend_from_slice(bytes.as_slice())
+    try self.write_some()
+    return Ok(item.serial)
+}
+
+/// Writes queued bytes, waiting at most `timeout_ms`.
+pub fn Connection.flush(&mut self, timeout_ms i32) Result<void, error.Error> {
+    try bounded(timeout_ms, 0)
+    deadline := try self.now() + u64(timeout_ms)
+    for !self.output.is_empty() {
+        now := try self.now()
+        if now >= deadline { return Err(error.new("tarn.dbus.Timeout", "Outgoing queue not written within the timeout")) }
+        try self.pump(i32(deadline - now))
+    }
+    return Ok(())
+}
+
+fn bounded(timeout_ms i32, minimum i32) Result<void, error.Error> {
+    if timeout_ms < minimum || timeout_ms > 60000 {
+        return Err(error.invalid("Timeout must be within the allowed range (at most 60000 ms)"))
+    }
+    return Ok(())
+}
+
+/// Sends a method call without waiting. Its reply, or a local NoReply error
+/// once `timeout_ms` passes, arrives through `dispatch` with this serial as
+/// `reply_serial`.
+pub fn Connection.send_call(&mut self, call message.Message, timeout_ms i32) Result<u32, error.Error> {
+    try bounded(timeout_ms, 1)
+    if call.kind != message.method_call() { return Err(error.invalid("send_call needs a method call")) }
+    expects := (call.flags & message.no_reply_expected()) == 0
+    serial := try self.send(call)
+    if expects { self.pending.push(Pending{serial: serial, deadline: try self.now() + u64(timeout_ms)}) }
+    return Ok(serial)
+}
+
+// Turns expired pending calls into local NoReply error messages.
+fn Connection.expire(&mut self) Result<void, error.Error> {
+    now := try self.now()
+    var index: usize = 0
+    for index < self.pending.len() {
+        if self.pending.get(index).deadline <= now {
+            gone := self.pending.swap_remove(index)
+            // Remember it so a late reply is dropped instead of surfacing as a stray message.
+            if self.expired.len() >= 256 { self.expired.swap_remove(0) }
+            self.expired.push(gone.serial)
+            var local = message.error_to(&message.call(&"", &"/", &"", &"Expired", Vec.new()), &"org.freedesktop.DBus.Error.NoReply", &"No reply within the timeout")
+            local.reply_serial = gone.serial
+            local.destination = self.unique.clone()
+            self.inbox.push(local)
+        } else {
+            index = index + 1
+        }
+    }
+    return Ok(())
+}
+
+/// Never blocks: reads what is available and returns up to `max` messages in
+/// arrival order, including replies to `send_call` and expired-call errors.
+pub fn Connection.dispatch(&mut self, max usize) Result<Vec<message.Message>, error.Error> {
+    if self.inbox.len() < max_inbox() { try self.pump(0) }
+    try self.expire()
+    var out: Vec<message.Message> = Vec.new()
+    for out.len() < max && !self.inbox.is_empty() {
+        match take(&mut self.inbox, 0) { Some(item) => { out.push(item) }
+            None => {} }
+    }
+    return Ok(out)
+}
+
+/// Waits up to `timeout_ms` for one message. None means nothing arrived.
+pub fn Connection.receive(&mut self, timeout_ms i32) Result<Option<message.Message>, error.Error> {
+    try bounded(timeout_ms, 0)
+    deadline := try self.now() + u64(timeout_ms)
+    for {
+        try self.expire()
+        if !self.inbox.is_empty() { return Ok(take(&mut self.inbox, 0)) }
+        now := try self.now()
+        if now >= deadline { return Ok(None) }
+        try self.pump(i32(deadline - now))
+    }
+}
+
+/// Blocking call: messages that arrive meanwhile stay queued for dispatch.
+/// Remote errors keep their D-Bus name; the first string argument is the text.
+pub fn Connection.call(&mut self, call message.Message, timeout_ms i32) Result<message.Message, error.Error> {
+    try bounded(timeout_ms, 1)
+    if (call.flags & message.no_reply_expected()) != 0 { return Err(error.invalid("call needs a reply; use send")) }
+    serial := try self.send_call(call, timeout_ms)
+    for {
+        var index: usize = 0
+        for index < self.inbox.len() {
+            if self.inbox.get(index).reply_serial == serial {
+                reply := try take(&mut self.inbox, index).ok_or(error.malformed("Reply vanished"))
+                if reply.kind == message.error_reply() { return Err(remote_error(&reply)) }
+                return Ok(reply)
+            }
+            index = index + 1
+        }
+        try self.expire()
+        try self.pump(50)
+    }
+}
+
+/// Error carried by an error reply.
+pub fn remote_error(reply &message.Message) error.Error {
+    var text = ""
+    if !reply.body.is_empty() {
+        match reply.body.get(0) { value.Value.Text(s) => { text = s.clone() }
+            _ => {} }
+    }
+    return error.new(&reply.error_name, &text)
+}
+
+/// Answers a method call. Nothing is sent when the caller set
+/// NO_REPLY_EXPECTED. Replying to anything but a call is an error.
+pub fn Connection.reply(&mut self, request &message.Message, body Vec<value.Value>) Result<void, error.Error> {
+    if request.kind != message.method_call() { return Err(error.invalid("Only method calls can be answered")) }
+    if (request.flags & message.no_reply_expected()) != 0 { return Ok(()) }
+    try self.send(message.reply_to(request, body))
+    return Ok(())
+}
+/// Answers a method call with a D-Bus error.
+pub fn Connection.reply_error(&mut self, request &message.Message, name &string, text &string) Result<void, error.Error> {
+    if request.kind != message.method_call() { return Err(error.invalid("Only method calls can be answered")) }
+    if !names.valid_error_name(name) { return Err(error.invalid("Invalid error name")) }
+    if (request.flags & message.no_reply_expected()) != 0 { return Ok(()) }
+    try self.send(message.error_to(request, name, text))
+    return Ok(())
+}
+
+/// Emits a broadcast signal (or a unicast one when `destination` is set).
+pub fn Connection.signal(&mut self, path &string, interface_name &string, member &string, body Vec<value.Value>, destination &string) Result<void, error.Error> {
+    var outgoing = message.signal_message(path, interface_name, member, body)
+    outgoing.destination = destination.clone()
+    try self.send(outgoing)
+    return Ok(())
+}
+
+fn bus_call(member &string, body Vec<value.Value>) message.Message {
+    return message.call(&"org.freedesktop.DBus", &"/org/freedesktop/DBus", &"org.freedesktop.DBus", member, body)
+}
+fn one_text(text &string) Vec<value.Value> {
+    var body: Vec<value.Value> = Vec.new()
+    body.push(value.text(text))
+    return body
+}
+
+/// Acquires a well-known name without queuing or replacing its owner.
+pub fn Connection.request_name(&mut self, name &string) Result<void, error.Error> {
+    if !names.valid_bus_name(name) || string.starts_with(name, &":") { return Err(error.invalid("Expected a well-known bus name")) }
+    var body = one_text(name)
+    body.push(value.Value.U32(4))
+    reply := try self.call(bus_call(&"RequestName", body), 5000)
+    match reply.body.get(0) {
+        value.Value.U32(code) => {
+            if code == 1 || code == 4 { return Ok(()) }
+            return Err(error.new("tarn.dbus.NameUnavailable", "Another connection owns this name"))
+        }
+        _ => { return Err(error.malformed("RequestName reply")) }
+    }
+}
+pub fn Connection.release_name(&mut self, name &string) Result<void, error.Error> {
+    try self.call(bus_call(&"ReleaseName", one_text(name)), 5000)
+    return Ok(())
+}
+pub fn Connection.add_match(&mut self, rule &string) Result<void, error.Error> {
+    try self.call(bus_call(&"AddMatch", one_text(rule)), 5000)
+    return Ok(())
+}
+pub fn Connection.remove_match(&mut self, rule &string) Result<void, error.Error> {
+    try self.call(bus_call(&"RemoveMatch", one_text(rule)), 5000)
+    return Ok(())
+}
+pub fn Connection.list_names(&mut self) Result<Vec<string>, error.Error> {
+    reply := try self.call(bus_call(&"ListNames", Vec.new()), 5000)
+    var out: Vec<string> = Vec.new()
+    match reply.body.get(0) {
+        value.Value.Array(list) => {
+            for item in list.items.as_slice() {
+                match item { value.Value.Text(s) => { out.push(s.clone()) }
+                    _ => { return Err(error.malformed("ListNames reply")) } }
+            }
+        }
+        _ => { return Err(error.malformed("ListNames reply")) }
+    }
+    return Ok(out)
+}
+pub fn Connection.name_owner(&mut self, name &string) Result<string, error.Error> {
+    reply := try self.call(bus_call(&"GetNameOwner", one_text(name)), 5000)
+    match reply.body.get(0) { value.Value.Text(s) => { return Ok(s.clone()) }
+        _ => { return Err(error.malformed("GetNameOwner reply")) } }
+}
+/// Unique name assigned by the bus (":1.N").
+pub fn Connection.unique_name(&self) string { return self.unique.clone() }
+/// Borrowed socket descriptor for a foreign event loop. Remove any foreign
+/// registration before the scope of `with_session` ends.
+pub fn Connection.raw_fd(&self) i32 { return self.stream.raw_fd() }
+
+fn wait_line(stream &mut net.UnixStream, poll &mut net.Poll, buffer &mut Vec<u8>, deadline time.Instant) Result<string, error.Error> {
+    var chunk = zeros(256)
+    for {
+        var index: usize = 0
+        for index + 1 < buffer.len() {
+            if buffer.as_slice()[index] == 13 && buffer.as_slice()[index + 1] == 10 {
+                line := try string.from_utf8(&buffer.as_slice()[0..index]).ok_or(error.new("tarn.dbus.AuthFailed", "Bad authentication reply"))
+                var rest: Vec<u8> = Vec.new()
+                rest.extend_from_slice(&buffer.as_slice()[index + 2..])
+                *buffer = rest
+                return Ok(line)
+            }
+            index = index + 1
+        }
+        if buffer.len() > 512 { return Err(error.new("tarn.dbus.AuthFailed", "Authentication line too long")) }
+        elapsed := try deadline.elapsed().map_err(fn(failure io.Error) error.Error { return io_failure("Clock failed", failure) })
+        if elapsed.as_millis() >= 5000 { return Err(error.new("tarn.dbus.AuthFailed", "Authentication timed out")) }
+        var events = [1]net.Event{net.Event.empty()}
+        try poll.wait(&mut events, i32(5000 - elapsed.as_millis())).map_err(fn(failure io.Error) error.Error { return io_failure("poll wait", failure) })
+        match stream.read(chunk.as_mut_slice()) {
+            Ok(count) => {
+                if count == 0 { return Err(error.new("tarn.dbus.AuthFailed", "Bus closed during authentication")) }
+                buffer.extend_from_slice(&chunk.as_slice()[0..count])
+            }
+            Err(failure) => {
+                match failure.kind { io.ErrorKind.WouldBlock => {}
+                    _ => { return Err(io_failure("Authentication read failed", failure)) } }
+            }
+        }
+    }
+}
+
+fn write_all_nonblocking(stream &mut net.UnixStream, poll &mut net.Poll, token net.Token, data &[]u8) Result<void, error.Error> {
+    var offset: usize = 0
+    for offset < data.len() {
+        match stream.write(&data[offset..]) {
+            Ok(count) => { offset = offset + count }
+            Err(failure) => {
+                match failure.kind {
+                    io.ErrorKind.WouldBlock => {
+                        try poll.modify_unix(stream, token, net.Interest.Writable).map_err(fn(f io.Error) error.Error { return io_failure("poll modify", f) })
+                        var events = [1]net.Event{net.Event.empty()}
+                        try poll.wait(&mut events, 5000).map_err(fn(f io.Error) error.Error { return io_failure("poll wait", f) })
+                        try poll.modify_unix(stream, token, net.Interest.Readable).map_err(fn(f io.Error) error.Error { return io_failure("poll modify", f) })
+                    }
+                    _ => { return Err(io_failure("Authentication write failed", failure)) }
+                }
+            }
+        }
+    }
+    return Ok(())
+}
+
+/// Connects to `path`, authenticates with EXTERNAL and sends Hello.
+pub fn open(path &string) Result<Connection, error.Error> {
+    var stream = try net.UnixStream.connect(path).map_err(fn(failure io.Error) error.Error { return io_failure("Cannot connect to the session bus", failure) })
+    try stream.set_nonblocking(true).map_err(fn(failure io.Error) error.Error { return io_failure("Cannot set non-blocking mode", failure) })
+    var poll = try net.Poll.new().map_err(fn(failure io.Error) error.Error { return io_failure("Cannot create poll", failure) })
+    token := try poll.register_unix(&stream, net.Interest.Readable).map_err(fn(failure io.Error) error.Error { return io_failure("Cannot register socket", failure) })
+    started := try time.Instant.now().map_err(fn(failure io.Error) error.Error { return io_failure("Clock failed", failure) })
+    uid := try current_uid()
+    var hello: Vec<u8> = Vec.new()
+    hello.push(0)
+    hello.extend_from_slice(("AUTH EXTERNAL " + encoding.hex(uid.bytes()) + "\r\n").bytes())
+    try write_all_nonblocking(&mut stream, &mut poll, token, hello.as_slice())
+    var buffer: Vec<u8> = Vec.new()
+    line := try wait_line(&mut stream, &mut poll, &mut buffer, started)
+    if !string.starts_with(&line, &"OK ") {
+        return Err(error.new("tarn.dbus.AuthFailed", &("Bus rejected EXTERNAL authentication: " + line)))
+    }
+    try write_all_nonblocking(&mut stream, &mut poll, token, "BEGIN\r\n".bytes())
+    var connection = Connection{stream: stream, poll: poll, token: token, started: started, serial: 0, unique: "",
+        input: buffer, output: Vec.new(), inbox: Vec.new(), pending: Vec.new(), expired: Vec.new(), scratch: zeros(65536), closed: false}
+    reply := try connection.call(bus_call(&"Hello", Vec.new()), 5000)
+    match reply.body.get(0) { value.Value.Text(s) => { connection.unique = s.clone() }
+        _ => { return Err(error.malformed("Hello reply")) } }
+    return Ok(connection)
+}
+
+/// Shuts the transport down. The socket and poll descriptors are released
+/// when the connection is destroyed at the end of its scope. Idempotent.
+pub fn Connection.close(&mut self) {
+    if self.closed { return }
+    self.closed = true
+    match self.poll.deregister_unix(&self.stream, self.token) { Ok(_) => {}
+        Err(_) => {} }
+    match self.stream.shutdown(net.Shutdown.Both) { Ok(_) => {}
+        Err(_) => {} }
+}
+
+/// Opens the session bus for the duration of `work` and closes it on every
+/// ordinary result, including Err. Owned names end with the connection.
+pub fn with_session(work mut fn(&mut Connection) Result<void, error.Error>) Result<void, error.Error> {
+    path := try session_path()
+    var bus = try open(&path)
+    result := work(&mut bus)
+    bus.close()
+    return result
+}

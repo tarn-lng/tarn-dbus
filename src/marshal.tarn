@@ -1,0 +1,362 @@
+// D-Bus wire format: alignment-padded encoding (little-endian output) and
+// bounded decoding of both byte orders. Offsets are relative to the start of
+// the buffer, which must itself be 8-aligned within the message.
+import "src/error"
+import "src/names"
+import "src/signature"
+import "src/value"
+import "string"
+
+/// Largest array the specification allows (64 MiB).
+pub fn max_array() usize { return 67108864 }
+/// Values decoded per message before LimitExceeded; `ay` counts as one.
+pub fn max_values() usize { return 4096 }
+fn u64_max() u64 { return 18446744073709551615 }
+fn two_52() f64 { return 4503599627370496.0 }
+
+// Two's-complement conversions without overflowing on the minimum value.
+fn bits(number i64) u64 {
+    if number < 0 { return u64(-(number + 1)) ^ u64_max() }
+    return u64(number)
+}
+fn signed(raw u64) i64 {
+    if raw > 9223372036854775807 { return -i64(raw ^ u64_max()) - 1 }
+    return i64(raw)
+}
+
+// IEEE 754 binary64 bit patterns, computed with exact power-of-two scaling.
+fn double_bits(x f64) u64 {
+    if x != x { return 9221120237041090560 }
+    var negative = x < 0.0
+    if x == 0.0 { negative = 1.0 / x < 0.0 }
+    var sign: u64 = 0
+    if negative { sign = 9223372036854775808 }
+    var m = x
+    if negative { m = -x }
+    if m == 0.0 { return sign }
+    if m > 1.7976931348623157e308 { return sign | 9218868437227405312 }
+    var e: i64 = 0
+    for m >= 2.0 {
+        m = m / 2.0
+        e = e + 1
+    }
+    for m < 1.0 && e > -1022 {
+        m = m * 2.0
+        e = e - 1
+    }
+    if m < 1.0 { return sign | u64(m * two_52()) }
+    return sign | (u64(e + 1023) << 52) | u64((m - 1.0) * two_52())
+}
+fn bits_double(raw u64) f64 {
+    exponent := (raw >> 52) & 2047
+    fraction := raw & 4503599627370495
+    var result: f64 = 0.0
+    if exponent == 2047 {
+        var zero: f64 = 0.0
+        if fraction != 0 { result = zero / zero } else { result = 1.0 / zero }
+    } else {
+        var mantissa = fraction
+        var scale: i64 = -1074
+        if exponent != 0 {
+            mantissa = fraction + 4503599627370496
+            scale = i64(exponent) - 1075
+        }
+        result = f64(mantissa)
+        for scale > 0 {
+            result = result * 2.0
+            scale = scale - 1
+        }
+        for scale < 0 {
+            result = result / 2.0
+            scale = scale + 1
+        }
+    }
+    if (raw >> 63) == 1 { return -result }
+    return result
+}
+
+/// Encoder that owns its output buffer.
+pub struct Writer { pub bytes Vec<u8> }
+pub fn Writer.new() Writer { return Writer{bytes: Vec.new()} }
+pub fn Writer.pad(&mut self, size usize) { for self.bytes.len() % size != 0 { self.bytes.push(0) } }
+fn Writer.word(&mut self, raw u64, size usize) {
+    self.pad(size)
+    var shift: u64 = 0
+    for shift < u64(size) * 8 {
+        self.bytes.push(u8((raw >> shift) & 255))
+        shift = shift + 8
+    }
+}
+fn Writer.patch_u32(&mut self, at usize, raw usize) {
+    var index: usize = 0
+    for index < 4 {
+        self.bytes.replace(at + index, u8((raw >> (index * 8)) & 255))
+        index = index + 1
+    }
+}
+pub fn Writer.put_u8(&mut self, raw u8) { self.bytes.push(raw) }
+pub fn Writer.put_u32(&mut self, raw u32) { self.word(u64(raw), 4) }
+pub fn Writer.put_string(&mut self, text &string) {
+    self.put_u32(u32(text.len()))
+    self.bytes.extend_from_slice(text.bytes())
+    self.bytes.push(0)
+}
+pub fn Writer.put_signature(&mut self, text &string) {
+    self.bytes.push(u8(text.len()))
+    self.bytes.extend_from_slice(text.bytes())
+    self.bytes.push(0)
+}
+
+fn Writer.array_start(&mut self, element_align usize) usize {
+    self.pad(4)
+    at := self.bytes.len()
+    self.put_u32(0)
+    self.pad(element_align)
+    return at
+}
+fn Writer.array_end(&mut self, at usize, start usize) Result<void, error.Error> {
+    length := self.bytes.len() - start
+    if length > max_array() { return Err(error.limit("Array longer than 64 MiB")) }
+    self.patch_u32(at, length)
+    return Ok(())
+}
+
+/// Appends one value; call `Value.check` first (encode_body does).
+pub fn Writer.put(&mut self, item &value.Value) Result<void, error.Error> {
+    match item {
+        value.Value.Byte(raw) => { self.bytes.push(raw) }
+        value.Value.Bool(flag) => {
+            var raw: u64 = 0
+            if flag { raw = 1 }
+            self.word(raw, 4)
+        }
+        value.Value.I16(raw) => { self.word(bits(i64(raw)) & 65535, 2) }
+        value.Value.U16(raw) => { self.word(u64(raw), 2) }
+        value.Value.I32(raw) => { self.word(bits(i64(raw)) & 4294967295, 4) }
+        value.Value.U32(raw) => { self.word(u64(raw), 4) }
+        value.Value.I64(raw) => { self.word(bits(raw), 8) }
+        value.Value.U64(raw) => { self.word(raw, 8) }
+        value.Value.Double(raw) => { self.word(double_bits(raw), 8) }
+        value.Value.Text(text) => { self.put_string(text) }
+        value.Value.Path(text) => { self.put_string(text) }
+        value.Value.Sig(text) => { self.put_signature(text) }
+        value.Value.Bytes(data) => {
+            if data.len() > max_array() { return Err(error.limit("Array longer than 64 MiB")) }
+            self.put_u32(u32(data.len()))
+            self.bytes.extend_from_slice(data.as_slice())
+        }
+        value.Value.Array(list) => {
+            at := self.array_start(signature.alignment(list.element.bytes()[0]))
+            start := self.bytes.len()
+            for element in list.items.as_slice() { try self.put(element) }
+            try self.array_end(at, start)
+        }
+        value.Value.Dict(map) => {
+            at := self.array_start(8)
+            start := self.bytes.len()
+            for entry in map.entries.as_slice() {
+                self.pad(8)
+                try self.put(&entry.key)
+                try self.put(&entry.value)
+            }
+            try self.array_end(at, start)
+        }
+        value.Value.Struct(fields) => {
+            self.pad(8)
+            for field in fields.as_slice() { try self.put(field) }
+        }
+        value.Value.Variant(held) => {
+            self.put_signature(&held.signature)
+            try self.put(held.inner.get(0))
+        }
+    }
+    return Ok(())
+}
+
+/// Encodes a message body after validating every value.
+pub fn encode_body(values &[]value.Value) Result<Vec<u8>, error.Error> {
+    var out = Writer.new()
+    for item in values {
+        try item.check()
+        try out.put(item)
+    }
+    if !signature.valid(&value.signature_of(values)) { return Err(error.limit("Body signature longer than 255 bytes")) }
+    return Ok(out.bytes)
+}
+
+/// Decoding position over a borrowed buffer. `big` selects big-endian input.
+pub struct Cursor { pub pos usize
+    pub big bool
+    pub count usize }
+pub fn Cursor.new(big bool) Cursor { return Cursor{pos: 0, big: big, count: 0} }
+
+fn need(data &[]u8, cur &Cursor, size usize) Result<void, error.Error> {
+    if size > data.len() || cur.pos > data.len() - size { return Err(error.malformed("Message truncated")) }
+    return Ok(())
+}
+/// Skips alignment padding, which the specification requires to be zero.
+pub fn align(data &[]u8, cur &mut Cursor, size usize) Result<void, error.Error> {
+    for cur.pos % size != 0 {
+        try need(data, cur, 1)
+        if data[cur.pos] != 0 { return Err(error.malformed("Non-zero alignment padding")) }
+        cur.pos = cur.pos + 1
+    }
+    return Ok(())
+}
+pub fn read_word(data &[]u8, cur &mut Cursor, size usize) Result<u64, error.Error> {
+    try align(data, cur, size)
+    try need(data, cur, size)
+    var raw: u64 = 0
+    var index: usize = 0
+    for index < size {
+        var shift = index * 8
+        if cur.big { shift = (size - 1 - index) * 8 }
+        raw = raw | (u64(data[cur.pos + index]) << u64(shift))
+        index = index + 1
+    }
+    cur.pos = cur.pos + size
+    return Ok(raw)
+}
+fn read_text(data &[]u8, cur &mut Cursor, length usize) Result<string, error.Error> {
+    try need(data, cur, length + 1)
+    start := cur.pos
+    var index: usize = 0
+    for index < length {
+        if data[start + index] == 0 { return Err(error.malformed("String contains NUL")) }
+        index = index + 1
+    }
+    if data[start + length] != 0 { return Err(error.malformed("String is not NUL-terminated")) }
+    cur.pos = start + length + 1
+    return string.from_utf8(&data[start..start + length]).ok_or(error.malformed("String is not valid UTF-8"))
+}
+pub fn read_string(data &[]u8, cur &mut Cursor) Result<string, error.Error> {
+    length := try read_word(data, cur, 4)
+    if length > u64(data.len()) { return Err(error.malformed("Message truncated")) }
+    return read_text(data, cur, usize(length))
+}
+pub fn read_signature(data &[]u8, cur &mut Cursor) Result<string, error.Error> {
+    try need(data, cur, 1)
+    length := usize(data[cur.pos])
+    cur.pos = cur.pos + 1
+    text := try read_text(data, cur, length)
+    if !signature.valid(&text) { return Err(error.malformed("Invalid signature")) }
+    return Ok(text)
+}
+
+fn counted(cur &mut Cursor) Result<void, error.Error> {
+    cur.count = cur.count + 1
+    if cur.count > max_values() { return Err(error.limit("Message has more than 4096 values")) }
+    return Ok(())
+}
+
+// Sign-extends a two's-complement value of `size` bytes.
+fn extend(raw u64, size usize) i64 {
+    half := u64(1) << u64(size * 8 - 1)
+    if raw >= half { return i64(raw) - i64(half) * 2 }
+    return i64(raw)
+}
+
+/// Decodes the complete type starting at `types[at]`. `depth` counts nested
+/// containers and variants (64 at most, as the specification's total).
+fn read_typed(data &[]u8, cur &mut Cursor, types &string, at usize, depth u32) Result<value.Value, error.Error> {
+    if depth > 64 { return Err(error.limit("Values nested deeper than 64 containers")) }
+    try counted(cur)
+    sig := types.bytes()
+    c := sig[at]
+    if c == 121 {
+        try need(data, cur, 1)
+        raw := data[cur.pos]
+        cur.pos = cur.pos + 1
+        return Ok(value.Value.Byte(raw))
+    }
+    if c == 98 {
+        raw := try read_word(data, cur, 4)
+        if raw > 1 { return Err(error.malformed("Boolean is neither 0 nor 1")) }
+        return Ok(value.Value.Bool(raw == 1))
+    }
+    if c == 110 { return Ok(value.Value.I16(i16(extend(try read_word(data, cur, 2), 2)))) }
+    if c == 113 { return Ok(value.Value.U16(u16(try read_word(data, cur, 2)))) }
+    if c == 105 { return Ok(value.Value.I32(i32(extend(try read_word(data, cur, 4), 4)))) }
+    if c == 117 { return Ok(value.Value.U32(u32(try read_word(data, cur, 4)))) }
+    if c == 120 { return Ok(value.Value.I64(signed(try read_word(data, cur, 8)))) }
+    if c == 116 { return Ok(value.Value.U64(try read_word(data, cur, 8))) }
+    if c == 100 { return Ok(value.Value.Double(bits_double(try read_word(data, cur, 8)))) }
+    if c == 115 { return Ok(value.Value.Text(try read_string(data, cur))) }
+    if c == 111 {
+        text := try read_string(data, cur)
+        if !names.valid_path(&text) { return Err(error.malformed("Invalid object path")) }
+        return Ok(value.Value.Path(text))
+    }
+    if c == 103 { return Ok(value.Value.Sig(try read_signature(data, cur))) }
+    if c == 118 {
+        inner_sig := try read_signature(data, cur)
+        if !signature.single(&inner_sig) { return Err(error.malformed("Variant signature is not one complete type")) }
+        inner := try read_typed(data, cur, &inner_sig, 0, depth + 1)
+        var held: Vec<value.Value> = Vec.new()
+        held.push(inner)
+        return Ok(value.Value.Variant(value.Variant{signature: inner_sig, inner: held}))
+    }
+    if c == 40 {
+        try align(data, cur, 8)
+        var fields: Vec<value.Value> = Vec.new()
+        var index = at + 1
+        for sig[index] != 41 {
+            end := try signature.type_end(sig, index)
+            fields.push(try read_typed(data, cur, types, index, depth + 1))
+            index = end
+        }
+        return Ok(value.Value.Struct(fields))
+    }
+    if c == 97 {
+        length := try read_word(data, cur, 4)
+        if length > u64(max_array()) { return Err(error.limit("Array longer than 64 MiB")) }
+        element_at := at + 1
+        try align(data, cur, signature.alignment(sig[element_at]))
+        try need(data, cur, usize(length))
+        end := cur.pos + usize(length)
+        if sig[element_at] == 121 {
+            var raw: Vec<u8> = Vec.new()
+            raw.extend_from_slice(&data[cur.pos..end])
+            cur.pos = end
+            return Ok(value.Value.Bytes(raw))
+        }
+        // The array's own end also ends its element (including `{...}`).
+        element_end := try signature.type_end(sig, at)
+        if sig[element_at] == 123 {
+            key_sig := try string.slice(types, element_at + 1, element_at + 2).ok_or(error.malformed("Bad dict signature"))
+            value_sig := try string.slice(types, element_at + 2, element_end - 1).ok_or(error.malformed("Bad dict signature"))
+            var map = value.dict(&key_sig, &value_sig)
+            for cur.pos < end {
+                try align(data, cur, 8)
+                key := try read_typed(data, cur, types, element_at + 1, depth + 1)
+                item := try read_typed(data, cur, types, element_at + 2, depth + 1)
+                map.put(key, item)
+            }
+            if cur.pos != end { return Err(error.malformed("Array length does not match its elements")) }
+            return Ok(map.done())
+        }
+        element := try string.slice(types, element_at, element_end).ok_or(error.malformed("Bad array signature"))
+        var items: Vec<value.Value> = Vec.new()
+        for cur.pos < end { items.push(try read_typed(data, cur, types, element_at, depth + 1)) }
+        if cur.pos != end { return Err(error.malformed("Array length does not match its elements")) }
+        return Ok(value.array(&element, items))
+    }
+    return Err(error.unsupported("Unsupported type code"))
+}
+
+/// Decodes values for `types` (a validated signature) from `data`.
+pub fn decode_values(data &[]u8, cur &mut Cursor, types &string) Result<Vec<value.Value>, error.Error> {
+    var values: Vec<value.Value> = Vec.new()
+    for complete in (try signature.split(types)).as_slice() {
+        values.push(try read_typed(data, cur, complete, 0, 0))
+    }
+    return Ok(values)
+}
+
+/// Decodes a whole body; trailing bytes are an error.
+pub fn decode_body(data &[]u8, types &string, big bool) Result<Vec<value.Value>, error.Error> {
+    var cur = Cursor.new(big)
+    values := try decode_values(data, &mut cur, types)
+    if cur.pos != data.len() { return Err(error.malformed("Body has trailing bytes")) }
+    return Ok(values)
+}

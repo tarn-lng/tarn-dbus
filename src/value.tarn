@@ -1,0 +1,190 @@
+// Typed D-Bus values. Containers keep their element signatures, so empty
+// arrays and dictionaries encode exactly, and decoded values round-trip.
+import "src/error"
+import "src/names"
+import "src/signature"
+
+pub enum Value {
+    Byte(u8)
+    Bool(bool)
+    I16(i16)
+    U16(u16)
+    I32(i32)
+    U32(u32)
+    I64(i64)
+    U64(u64)
+    Double(f64)
+    Text(string)
+    Path(string)
+    Sig(string)
+    /// `ay`, kept as raw bytes (icons, binary payloads).
+    Bytes(Vec<u8>)
+    Array(Array)
+    Dict(Dict)
+    Struct(Vec<Value>)
+    Variant(Variant)
+}
+/// Array of one complete element type other than `y` (use Bytes) or dict entries.
+pub struct Array { pub element string
+    pub items Vec<Value> }
+/// `a{KV}`: key is a basic type, value any complete type.
+pub struct Dict { pub key string
+    pub value string
+    pub entries Vec<Entry> }
+pub struct Entry { pub key Value
+    pub value Value }
+/// A variant holds exactly one value with its own signature.
+pub struct Variant { pub signature string
+    pub inner Vec<Value> }
+
+pub fn text(value &string) Value { return Value.Text(value.clone()) }
+pub fn path(value &string) Value { return Value.Path(value.clone()) }
+pub fn array(element &string, items Vec<Value>) Value { return Value.Array(Array{element: element.clone(), items: items}) }
+pub fn structure(fields Vec<Value>) Value { return Value.Struct(fields) }
+pub fn variant(inner Value) Value {
+    sig := inner.signature()
+    var held: Vec<Value> = Vec.new()
+    held.push(inner)
+    return Value.Variant(Variant{signature: sig, inner: held})
+}
+pub fn dict(key &string, value &string) Dict { return Dict{key: key.clone(), value: value.clone(), entries: Vec.new()} }
+/// The common `a{sv}` property/hint map.
+pub fn dict_sv() Dict { return dict("s", "v") }
+pub fn Dict.put(&mut self, key Value, value Value) { self.entries.push(Entry{key: key, value: value}) }
+/// Adds `key -> variant(value)` to an `a{sv}` map.
+pub fn Dict.put_sv(&mut self, key &string, value Value) { self.put(text(key), variant(value)) }
+pub fn Dict.done(self) Value { return Value.Dict(self) }
+
+pub fn Value.signature(&self) string {
+    match self {
+        Value.Byte(_) => { return "y" }
+        Value.Bool(_) => { return "b" }
+        Value.I16(_) => { return "n" }
+        Value.U16(_) => { return "q" }
+        Value.I32(_) => { return "i" }
+        Value.U32(_) => { return "u" }
+        Value.I64(_) => { return "x" }
+        Value.U64(_) => { return "t" }
+        Value.Double(_) => { return "d" }
+        Value.Text(_) => { return "s" }
+        Value.Path(_) => { return "o" }
+        Value.Sig(_) => { return "g" }
+        Value.Bytes(_) => { return "ay" }
+        Value.Array(value) => { return "a" + value.element.clone() }
+        Value.Dict(value) => { return "a{" + value.key.clone() + value.value.clone() + "}" }
+        Value.Struct(fields) => {
+            var out = "("
+            for field in fields.as_slice() { out = out + field.signature() }
+            return out + ")"
+        }
+        Value.Variant(_) => { return "v" }
+    }
+}
+
+/// Signature of a sequence of values, as used for message bodies.
+pub fn signature_of(values &[]Value) string {
+    var out = ""
+    for value in values { out = out + value.signature() }
+    return out
+}
+
+fn no_nul(value &string) bool {
+    for c in value.bytes() { if c == 0 { return false } }
+    return true
+}
+
+fn expect(value &Value, wanted &string) Result<void, error.Error> {
+    if !value.signature().eq(wanted) {
+        return Err(error.invalid("Container item does not match its declared element signature"))
+    }
+    return Ok(())
+}
+
+/// Checks the value against the wire rules before encoding: element and
+/// variant signatures, strings without NUL, valid object paths and
+/// signatures, and the specification's nesting limits.
+pub fn Value.check(&self) Result<void, error.Error> {
+    if !signature.single(&self.signature()) {
+        return Err(error.invalid("Value exceeds signature limits or has an invalid container type"))
+    }
+    return check_depth(self, 0)
+}
+
+fn check_depth(value &Value, depth u32) Result<void, error.Error> {
+    if depth > 64 { return Err(error.limit("Values nested deeper than 64 containers")) }
+    match value {
+        Value.Text(s) => { if !no_nul(s) { return Err(error.invalid("Strings cannot contain NUL")) } }
+        Value.Path(s) => { if !names.valid_path(s) { return Err(error.invalid("Invalid object path")) } }
+        Value.Sig(s) => { if !signature.valid(s) { return Err(error.invalid("Invalid signature value")) } }
+        Value.Array(list) => {
+            if !signature.single(&list.element) || list.element.eq(&"y") {
+                return Err(error.invalid("Array element must be one complete type; use Bytes for ay"))
+            }
+            for item in list.items.as_slice() {
+                try expect(item, &list.element)
+                try check_depth(item, depth + 1)
+            }
+        }
+        Value.Dict(map) => {
+            kb := map.key.bytes()
+            if kb.len() != 1 || !signature.is_basic(kb[0]) || !signature.single(&map.value) {
+                return Err(error.invalid("Dict key must be basic and value one complete type"))
+            }
+            for entry in map.entries.as_slice() {
+                try expect(&entry.key, &map.key)
+                try expect(&entry.value, &map.value)
+                try check_depth(&entry.key, depth + 1)
+                try check_depth(&entry.value, depth + 1)
+            }
+        }
+        Value.Struct(fields) => {
+            if fields.is_empty() { return Err(error.invalid("Structs need at least one field")) }
+            for field in fields.as_slice() { try check_depth(field, depth + 1) }
+        }
+        Value.Variant(held) => {
+            if held.inner.len() != 1 { return Err(error.invalid("A variant holds exactly one value")) }
+            inner := held.inner.get(0)
+            try expect(inner, &held.signature)
+            try check_depth(inner, depth + 1)
+        }
+        _ => {}
+    }
+    return Ok(())
+}
+
+/// Deep copy.
+pub fn Value.clone(&self) Value {
+    match self {
+        Value.Byte(raw) => { return Value.Byte(raw) }
+        Value.Bool(flag) => { return Value.Bool(flag) }
+        Value.I16(raw) => { return Value.I16(raw) }
+        Value.U16(raw) => { return Value.U16(raw) }
+        Value.I32(raw) => { return Value.I32(raw) }
+        Value.U32(raw) => { return Value.U32(raw) }
+        Value.I64(raw) => { return Value.I64(raw) }
+        Value.U64(raw) => { return Value.U64(raw) }
+        Value.Double(raw) => { return Value.Double(raw) }
+        Value.Text(s) => { return Value.Text(s.clone()) }
+        Value.Path(s) => { return Value.Path(s.clone()) }
+        Value.Sig(s) => { return Value.Sig(s.clone()) }
+        Value.Bytes(data) => {
+            var copy_of: Vec<u8> = Vec.new()
+            copy_of.extend_from_slice(data.as_slice())
+            return Value.Bytes(copy_of)
+        }
+        Value.Array(list) => { return Value.Array(Array{element: list.element.clone(), items: clone_all(list.items.as_slice())}) }
+        Value.Dict(map) => { return Value.Dict(map.clone()) }
+        Value.Struct(fields) => { return Value.Struct(clone_all(fields.as_slice())) }
+        Value.Variant(held) => { return Value.Variant(Variant{signature: held.signature.clone(), inner: clone_all(held.inner.as_slice())}) }
+    }
+}
+pub fn clone_all(items &[]Value) Vec<Value> {
+    var out: Vec<Value> = Vec.new()
+    for item in items { out.push(item.clone()) }
+    return out
+}
+pub fn Dict.clone(&self) Dict {
+    var out = dict(&self.key, &self.value)
+    for entry in self.entries.as_slice() { out.put(entry.key.clone(), entry.value.clone()) }
+    return out
+}

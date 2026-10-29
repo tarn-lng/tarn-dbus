@@ -1,22 +1,56 @@
-import dbus
-import dbus.service
-from dbus.mainloop.glib import DBusGMainLoop
-from gi.repository import GLib
-DBusGMainLoop(set_as_default=True)
-bus=dbus.SessionBus();name=dbus.service.BusName('org.tarn.DBusTest',bus)
-class Fixture(dbus.service.Object):
-    @dbus.service.method('org.tarn.DBusTest',in_signature='',out_signature='sbiutas')
-    def Mixed(self):return 'Tarn',True,-42,4294967295,18446744073709551615,['one','two']
-    @dbus.service.method('org.tarn.DBusTest',in_signature='',out_signature='')
-    def Empty(self):pass
-    @dbus.service.method('org.tarn.DBusTest',in_signature='',out_signature='as')
-    def Huge(self):return ['bounded']*5000
-    @dbus.service.method('org.tarn.DBusTest',in_signature='',out_signature='(su)a{sv}')
-    def Nested(self):return ('nested',7),{'active':dbus.Boolean(True,variant_level=1)}
-    @dbus.service.method('org.tarn.DBusTest',in_signature='',out_signature='',async_callbacks=('reply','failure'))
-    def Slow(self,reply,failure):
-        def done():reply();return False
-        GLib.timeout_add(100,done)
-    @dbus.service.method('org.tarn.DBusTest',in_signature='',out_signature='d')
-    def Unsupported(self):return 3.5
-fixture=Fixture(bus,'/Test');print('READY',flush=True);GLib.MainLoop().run()
+"""Test-only service on the isolated session bus, implemented with GDBus."""
+from gi.repository import Gio, GLib
+
+XML = """
+<node>
+  <interface name="org.tarn.DBusTest">
+    <method name="Mixed"><arg type="s" direction="out"/><arg type="b" direction="out"/><arg type="i" direction="out"/>
+      <arg type="u" direction="out"/><arg type="t" direction="out"/><arg type="as" direction="out"/></method>
+    <method name="Empty"/>
+    <method name="Huge"><arg type="as" direction="out"/></method>
+    <method name="Nested"><arg type="(su)" direction="out"/><arg type="a{sv}" direction="out"/></method>
+    <method name="Slow"/>
+    <method name="Unsupported"><arg type="d" direction="out"/></method>
+    <method name="Echo"><arg type="v" direction="in"/><arg type="v" direction="out"/></method>
+    <method name="Burst"><arg type="u" direction="in"/></method>
+    <method name="Fail"/>
+  </interface>
+</node>
+"""
+V = GLib.Variant
+
+
+def call(connection, sender, path, interface, method, params, invocation):
+    if method == "Mixed":
+        invocation.return_value(V("(sbiutas)", ("Tarn", True, -42, 4294967295, 18446744073709551615, ["one", "two"])))
+    elif method == "Empty":
+        invocation.return_value(None)
+    elif method == "Huge":
+        invocation.return_value(V("(as)", (["bounded"] * 5000,)))
+    elif method == "Nested":
+        invocation.return_value(V("((su)a{sv})", (("nested", 7), {"active": V("b", True)})))
+    elif method == "Slow":
+        GLib.timeout_add(100, lambda: invocation.return_value(None) and False)
+    elif method == "Unsupported":
+        invocation.return_value(V("(d)", (3.5,)))
+    elif method == "Echo":
+        invocation.return_value(params)
+    elif method == "Burst":
+        # Signals addressed to the caller, then the reply: ordering test.
+        count = params.unpack()[0]
+        for index in range(count):
+            connection.emit_signal(sender, "/Test", "org.tarn.DBusTest", "Tick", V("(u)", (index,)))
+        invocation.return_value(None)
+    elif method == "Fail":
+        invocation.return_dbus_error("org.tarn.DBusTest.Error.Failed", "deliberate failure")
+
+
+def acquired(connection, name):
+    print("READY", flush=True)
+
+
+bus = Gio.bus_get_sync(Gio.BusType.SESSION)
+info = Gio.DBusNodeInfo.new_for_xml(XML).interfaces[0]
+bus.register_object("/Test", info, call)
+Gio.bus_own_name_on_connection(bus, "org.tarn.DBusTest", Gio.BusNameOwnerFlags.NONE, acquired, None)
+GLib.MainLoop().run()

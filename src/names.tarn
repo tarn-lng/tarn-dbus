@@ -1,0 +1,66 @@
+// Validation of bus names, object paths, interfaces, members and error names
+// following the D-Bus specification. All rules are ASCII and length-bounded.
+
+fn is_alpha(c u8) bool { return (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c == 95 }
+fn is_digit(c u8) bool { return c >= 48 && c <= 57 }
+
+/// "/" or "/segment(/segment)*", segments of [A-Za-z0-9_], no trailing slash.
+pub fn valid_path(path &string) bool {
+    bytes := path.bytes()
+    if bytes.len() == 0 || bytes[0] != 47 { return false }
+    if bytes.len() == 1 { return true }
+    var previous_slash = true
+    var index: usize = 1
+    for index < bytes.len() {
+        c := bytes[index]
+        index = index + 1
+        if c == 47 {
+            if previous_slash { return false }
+            previous_slash = true
+        } else {
+            if !is_alpha(c) && !is_digit(c) { return false }
+            previous_slash = false
+        }
+    }
+    return !previous_slash
+}
+
+/// A member: [A-Za-z_][A-Za-z0-9_]*, 1..255 bytes.
+pub fn valid_member(member &string) bool {
+    bytes := member.bytes()
+    if bytes.len() == 0 || bytes.len() > 255 || !is_alpha(bytes[0]) { return false }
+    for c in bytes { if !is_alpha(c) && !is_digit(c) { return false } }
+    return true
+}
+
+// Dotted names: at least two elements, none empty, each element starts with
+// a letter or underscore (or, when allowed, a hyphen or digit).
+fn valid_dotted(bytes &[]u8, hyphen bool, leading_digit bool) bool {
+    if bytes.len() == 0 || bytes.len() > 255 { return false }
+    var elements: usize = 1
+    var start = true
+    for c in bytes {
+        if c == 46 {
+            if start { return false }
+            elements = elements + 1
+            start = true
+        } else {
+            ok := is_alpha(c) || (hyphen && c == 45) || (is_digit(c) && (!start || leading_digit))
+            if !ok { return false }
+            start = false
+        }
+    }
+    return !start && elements >= 2
+}
+
+/// Interface names and error names share the same grammar.
+pub fn valid_interface(name &string) bool { return valid_dotted(name.bytes(), false, false) }
+pub fn valid_error_name(name &string) bool { return valid_dotted(name.bytes(), false, false) }
+
+/// Unique (":1.42") or well-known ("org.example.App") bus names.
+pub fn valid_bus_name(name &string) bool {
+    bytes := name.bytes()
+    if bytes.len() > 255 { return false }
+    if bytes.len() > 0 && bytes[0] == 58 { return valid_dotted(&bytes[1..], true, true) }
+    return valid_dotted(bytes, true, false)
+}

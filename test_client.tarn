@@ -132,5 +132,5 @@ fn main() {
     }
     current := fd_count()
     if current > baseline { panic("connection descriptors leaked on Err") }
-    print("PASS: ABI, calls, names, signals, bounded receive, errors and scoped cleanup")
+    print("PASS: calls, names, signals, bounded receive, errors and scoped cleanup")
 }

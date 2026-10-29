@@ -1,0 +1,190 @@
+// Native connection tests on an isolated bus with tests/fixture.py running.
+import "src/connection"
+import "src/error"
+import "src/message"
+import "src/value"
+import "fs"
+import "os"
+import "string"
+
+struct Report { failures u32
+    checks u32 }
+fn Report.check(&mut self, passed bool, what &string) {
+    self.checks = self.checks + 1
+    if !passed {
+        self.failures = self.failures + 1
+        print("FAIL " + what.clone())
+    }
+}
+
+fn test_call(member &string, body Vec<value.Value>) message.Message {
+    return message.call(&"org.tarn.DBusTest", &"/Test", &"org.tarn.DBusTest", member, body)
+}
+
+fn addresses(report &mut Report) {
+    match connection.socket_path(&"unix:path=/run/user/1000/bus") {
+        Ok(path) => { report.check(path.eq(&"/run/user/1000/bus"), &"plain unix path") }
+        Err(_) => { report.check(false, &"plain unix path") }
+    }
+    match connection.socket_path(&"tcp:host=x,port=1;unix:guid=abc,path=/tmp/a%20b") {
+        Ok(path) => { report.check(path.eq(&"/tmp/a b"), &"second entry with %XX escape") }
+        Err(_) => { report.check(false, &"second entry with %XX escape") }
+    }
+    match connection.socket_path(&"unix:abstract=/tmp/dbus-x") {
+        Ok(_) => { report.check(false, &"abstract address rejected") }
+        Err(e) => { report.check(e.name.eq(&"tarn.dbus.UnsupportedAddress"), &"abstract address rejected") }
+    }
+    match connection.socket_path(&"unix:path=/tmp/%zz") {
+        Ok(_) => { report.check(false, &"bad escape rejected") }
+        Err(e) => { report.check(e.name.eq(&"tarn.dbus.InvalidArgument"), &"bad escape rejected") }
+    }
+}
+
+fn cpu_ticks() u64 {
+    match fs.read(&"/proc/self/stat") {
+        Ok(raw) => {
+            text := string.from_utf8(raw.as_slice()).unwrap_or("")
+            // Fields after the parenthesised command name; utime and stime are 14 and 15.
+            match string.rfind(&text, &")") {
+                Some(end) => {
+                    rest := string.slice(&text, end + 2, text.len()).unwrap_or("")
+                    fields := string.fields(&rest)
+                    if fields.len() > 12 {
+                        return string.parse_u64(fields.get(11)).unwrap_or(0) + string.parse_u64(fields.get(12)).unwrap_or(0)
+                    }
+                }
+                None => {}
+            }
+        }
+        Err(_) => {}
+    }
+    return 0
+}
+
+fn session(bus &mut connection.Connection, report &mut Report) Result<void, error.Error> {
+    report.check(string.starts_with(&bus.unique_name(), &":"), &"unique name from Hello")
+    report.check(bus.raw_fd() > 2, &"raw_fd is a real descriptor")
+
+    // Typed round trip through a variant.
+    var hints = value.dict_sv()
+    hints.put_sv(&"urgency", value.Value.Byte(2))
+    hints.put_sv(&"ratio", value.Value.Double(0.25))
+    var body: Vec<value.Value> = Vec.new()
+    body.push(value.variant(hints.done()))
+    reply := try bus.call(test_call(&"Echo", body), 2000)
+    report.check(reply.signature.eq(&"v"), &"typed echo signature")
+    match reply.body.get(0) {
+        value.Value.Variant(held) => { report.check(held.signature.eq(&"a{sv}"), &"typed echo variant content") }
+        _ => { report.check(false, &"typed echo variant") }
+    }
+
+    // Remote error names survive.
+    match bus.call(test_call(&"Fail", Vec.new()), 2000) {
+        Ok(_) => { report.check(false, &"remote error") }
+        Err(e) => { report.check(e.name.eq(&"org.tarn.DBusTest.Error.Failed") && e.message.eq(&"deliberate failure"), &"remote error name and text") }
+    }
+
+    // Non-blocking calls: replies come back through dispatch by serial.
+    first := try bus.send_call(test_call(&"Empty", Vec.new()), 2000)
+    second := try bus.send_call(test_call(&"Mixed", Vec.new()), 2000)
+    slow := try bus.send_call(test_call(&"Slow", Vec.new()), 10)
+    var got_first = false
+    var got_second = false
+    var slow_error = ""
+    var rounds = 0
+    for rounds < 200 && (!got_first || !got_second || slow_error.is_empty()) {
+        match bus.receive(20) {
+            Ok(Some(item)) => {
+                if item.reply_serial == first { got_first = true }
+                if item.reply_serial == second { got_second = item.signature.eq(&"sbiutas") }
+                if item.reply_serial == slow && item.kind == message.error_reply() { slow_error = item.error_name.clone() }
+            }
+            _ => {}
+        }
+        rounds = rounds + 1
+    }
+    report.check(got_first && got_second, &"async replies matched by serial")
+    report.check(slow_error.eq(&"org.freedesktop.DBus.Error.NoReply"), &"pending call expires locally")
+
+    // 1000 unicast signals arrive before the reply; call() keeps them queued in order.
+    var count: Vec<value.Value> = Vec.new()
+    count.push(value.Value.U32(1000))
+    try bus.call(test_call(&"Burst", count), 10000)
+    var next: u32 = 0
+    var ordered = true
+    var batches = 0
+    for next < 1000 && batches < 100 {
+        batch := try bus.dispatch(300)
+        for item in batch.as_slice() {
+            if item.member.eq(&"Tick") {
+                match item.body.get(0) {
+                    value.Value.U32(index) => {
+                        if index != next { ordered = false }
+                        next = next + 1
+                    }
+                    _ => { ordered = false }
+                }
+            }
+        }
+        batches = batches + 1
+    }
+    report.check(next == 1000 && ordered, &"1000 signals kept in order around a blocking call")
+
+    // Typed broadcast signal received through a match rule.
+    rule := "type='signal',interface='org.tarn.Native',member='Typed'"
+    try bus.add_match(&rule)
+    var payload: Vec<value.Value> = Vec.new()
+    payload.push(value.text(&"hola"))
+    payload.push(value.Value.I64(-7))
+    try bus.signal(&"/Native", &"org.tarn.Native", &"Typed", payload, &"")
+    var typed = false
+    var tries = 0
+    for !typed && tries < 50 {
+        match try bus.receive(20) {
+            Some(item) => { typed = item.member.eq(&"Typed") && item.signature.eq(&"sx") && item.sender.eq(&bus.unique_name()) }
+            None => {}
+        }
+        tries = tries + 1
+    }
+    report.check(typed, &"typed broadcast signal")
+    try bus.remove_match(&rule)
+
+    // A 1 MiB body is written in pieces and flushed within its bound.
+    var big: Vec<u8> = Vec.new()
+    for big.len() < 1048576 { big.push(7) }
+    var bytes_body: Vec<value.Value> = Vec.new()
+    bytes_body.push(value.variant(value.Value.Bytes(big)))
+    echoed := try bus.call(test_call(&"Echo", bytes_body), 10000)
+    match echoed.body.get(0) {
+        value.Value.Variant(held) => {
+            match held.inner.get(0) { value.Value.Bytes(data) => { report.check(data.len() == 1048576, &"1 MiB echo") }
+                _ => { report.check(false, &"1 MiB echo type") } }
+        }
+        _ => { report.check(false, &"1 MiB echo") }
+    }
+    try bus.flush(1000)
+
+    // Bounds are enforced.
+    match bus.receive(-1) { Ok(_) => { report.check(false, &"negative wait") }
+        Err(_) => { report.check(true, &"negative wait") } }
+    match bus.call(test_call(&"Empty", Vec.new()), 0) { Ok(_) => { report.check(false, &"zero call timeout") }
+        Err(_) => { report.check(true, &"zero call timeout") } }
+
+    // Idle: waiting two seconds with no traffic uses no measurable CPU.
+    before := cpu_ticks()
+    idle := try bus.receive(2000)
+    report.check(idle.is_none(), &"late reply to an expired call is dropped")
+    report.check(cpu_ticks() - before <= 2, &"idle wait does not spin")
+    return Ok(())
+}
+
+fn main() {
+    var report = Report{failures: 0, checks: 0}
+    addresses(&mut report)
+    match connection.with_session(fn(bus &mut connection.Connection) Result<void, error.Error> { return session(bus, &mut report) }) {
+        Ok(_) => {}
+        Err(e) => { report.check(false, &("session: " + e.name + ": " + e.message)) }
+    }
+    print("native checks: " + string.from_u64(u64(report.checks)) + ", failures: " + string.from_u64(u64(report.failures)))
+    if report.failures != 0 { os.exit(1) }
+}
