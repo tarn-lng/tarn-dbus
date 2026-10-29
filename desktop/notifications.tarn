@@ -1,0 +1,217 @@
+// org.freedesktop.Notifications 1.2 client: send, replace and close
+// notifications and read their events. Spec binding only: no rate limiting,
+// grouping or other application policy.
+import "src/connection"
+import "src/error"
+import "src/message"
+import "src/value"
+
+fn service() string { return "org.freedesktop.Notifications" }
+fn object_path() string { return "/org/freedesktop/Notifications" }
+
+fn request(member &string, body Vec<value.Value>) message.Message {
+    return message.call(&service(), &object_path(), &service(), member, body)
+}
+
+pub enum Urgency { Low
+    Normal
+    Critical }
+
+pub struct Action { pub key string
+    pub label string }
+
+/// A notification description. `timeout_ms`: -1 server default, 0 never.
+pub struct Notification {
+    pub app_name string
+    pub replaces_id u32
+    pub icon string
+    pub summary string
+    pub body string
+    pub actions Vec<Action>
+    pub hints value.Dict
+    pub timeout_ms i32
+}
+
+pub fn Notification.new(app_name &string, summary &string) Notification {
+    return Notification{app_name: app_name.clone(), replaces_id: 0, icon: "", summary: summary.clone(), body: "",
+        actions: Vec.new(), hints: value.dict_sv(), timeout_ms: -1}
+}
+pub fn Notification.with_body(self, text &string) Notification {
+    var out = self
+    out.body = text.clone()
+    return out
+}
+pub fn Notification.with_icon(self, name &string) Notification {
+    var out = self
+    out.icon = name.clone()
+    return out
+}
+/// Replaces an earlier notification instead of showing a new one.
+pub fn Notification.replacing(self, id u32) Notification {
+    var out = self
+    out.replaces_id = id
+    return out
+}
+pub fn Notification.with_timeout(self, milliseconds i32) Notification {
+    var out = self
+    out.timeout_ms = milliseconds
+    return out
+}
+/// A button. The key "default" is the action for clicking the notification.
+pub fn Notification.with_action(self, key &string, label &string) Notification {
+    var out = self
+    out.actions.push(Action{key: key.clone(), label: label.clone()})
+    return out
+}
+pub fn Notification.with_urgency(self, level Urgency) Notification {
+    var raw: u8 = 1
+    match level { Urgency.Low => { raw = 0 }
+        Urgency.Normal => { raw = 1 }
+        Urgency.Critical => { raw = 2 } }
+    return self.hint(&"urgency", value.Value.Byte(raw))
+}
+pub fn Notification.with_category(self, name &string) Notification { return self.hint(&"category", value.text(name)) }
+/// Desktop file name without ".desktop"; lets the server show app icon/name.
+pub fn Notification.with_desktop_entry(self, name &string) Notification { return self.hint(&"desktop-entry", value.text(name)) }
+pub fn Notification.with_image_path(self, path &string) Notification { return self.hint(&"image-path", value.text(path)) }
+/// Not kept in the notification history.
+pub fn Notification.transient(self) Notification { return self.hint(&"transient", value.Value.Bool(true)) }
+/// Stays after an action is invoked, until closed explicitly.
+pub fn Notification.resident(self) Notification { return self.hint(&"resident", value.Value.Bool(true)) }
+/// Any other hint; the value is wrapped in a variant. A repeated key is replaced.
+pub fn Notification.hint(self, key &string, item value.Value) Notification {
+    var out = self
+    var kept = value.dict_sv()
+    for entry in out.hints.entries.as_slice() {
+        match &entry.key {
+            value.Value.Text(name) => {
+                if !name.eq(key) { kept.put(value.text(name), entry.value.clone()) }
+            }
+            _ => {}
+        }
+    }
+    kept.put_sv(key, item)
+    out.hints = kept
+    return out
+}
+
+fn Notification.body_values(&self) Vec<value.Value> {
+    var actions: Vec<value.Value> = Vec.new()
+    for action in self.actions.as_slice() {
+        actions.push(value.text(&action.key))
+        actions.push(value.text(&action.label))
+    }
+    var out: Vec<value.Value> = Vec.new()
+    out.push(value.text(&self.app_name))
+    out.push(value.Value.U32(self.replaces_id))
+    out.push(value.text(&self.icon))
+    out.push(value.text(&self.summary))
+    out.push(value.text(&self.body))
+    out.push(value.array(&"s", actions))
+    out.push(value.Value.Dict(self.hints.clone()))
+    out.push(value.Value.I32(self.timeout_ms))
+    return out
+}
+
+/// Shows (or replaces) a notification and returns its id.
+pub fn notify(bus &mut connection.Connection, item &Notification, timeout_ms i32) Result<u32, error.Error> {
+    reply := try bus.call(request(&"Notify", item.body_values()), timeout_ms)
+    if reply.body.len() == 1 {
+        match reply.body.get(0) { value.Value.U32(id) => { return Ok(id) }
+            _ => {} }
+    }
+    return Err(error.malformed("Notify reply is not one uint32"))
+}
+
+/// Closes a notification; the server answers with a NotificationClosed event.
+pub fn close(bus &mut connection.Connection, id u32, timeout_ms i32) Result<void, error.Error> {
+    var body: Vec<value.Value> = Vec.new()
+    body.push(value.Value.U32(id))
+    try bus.call(request(&"CloseNotification", body), timeout_ms)
+    return Ok(())
+}
+
+/// Optional features the server supports, such as "actions" or "body-markup".
+pub fn capabilities(bus &mut connection.Connection, timeout_ms i32) Result<Vec<string>, error.Error> {
+    reply := try bus.call(request(&"GetCapabilities", Vec.new()), timeout_ms)
+    var out: Vec<string> = Vec.new()
+    if reply.body.len() == 1 {
+        match reply.body.get(0) {
+            value.Value.Array(list) => {
+                for item in list.items.as_slice() {
+                    match item { value.Value.Text(name) => { out.push(name.clone()) }
+                        _ => {} }
+                }
+                return Ok(out)
+            }
+            _ => {}
+        }
+    }
+    return Err(error.malformed("GetCapabilities reply is not as"))
+}
+
+pub struct ServerInfo { pub name string
+    pub vendor string
+    pub version string
+    pub spec_version string }
+
+pub fn server_information(bus &mut connection.Connection, timeout_ms i32) Result<ServerInfo, error.Error> {
+    reply := try bus.call(request(&"GetServerInformation", Vec.new()), timeout_ms)
+    var texts: Vec<string> = Vec.new()
+    for item in reply.body.as_slice() {
+        match item { value.Value.Text(s) => { texts.push(s.clone()) }
+            _ => {} }
+    }
+    if texts.len() != 4 { return Err(error.malformed("GetServerInformation reply is not ssss")) }
+    return Ok(ServerInfo{name: texts.get(0).clone(), vendor: texts.get(1).clone(), version: texts.get(2).clone(),
+        spec_version: texts.get(3).clone()})
+}
+
+/// Subscribes to the server's signals; events then arrive through dispatch
+/// or receive and are read with `event`.
+pub fn subscribe(bus &mut connection.Connection) Result<void, error.Error> {
+    return bus.add_match(&("type='signal',interface='" + service() + "',path='" + object_path() + "'"))
+}
+
+pub enum CloseReason { Expired
+    Dismissed
+    Closed
+    Undefined }
+
+pub enum Event {
+    /// The user chose an action ("default" for the notification itself).
+    ActionInvoked(Invoked)
+    Closed(Closed)
+    /// XDG activation token, sent just before ActionInvoked when supported.
+    ActivationToken(Invoked)
+}
+pub struct Invoked { pub id u32
+    pub text string }
+pub struct Closed { pub id u32
+    pub reason CloseReason }
+
+/// Reads a notification event from a received message; None for anything else.
+pub fn event(item &message.Message) Option<Event> {
+    if item.kind != message.signal() || !item.interface_name.eq(&service()) || !item.path.eq(&object_path()) { return None }
+    if item.body.len() != 2 { return None }
+    var id: u32 = 0
+    match item.body.get(0) { value.Value.U32(raw) => { id = raw }
+        _ => { return None } }
+    match item.body.get(1) {
+        value.Value.Text(text) => {
+            if item.member.eq(&"ActionInvoked") { return Some(Event.ActionInvoked(Invoked{id: id, text: text.clone()})) }
+            if item.member.eq(&"ActivationToken") { return Some(Event.ActivationToken(Invoked{id: id, text: text.clone()})) }
+        }
+        value.Value.U32(raw) => {
+            if item.member.eq(&"NotificationClosed") {
+                var reason = CloseReason.Undefined
+                if raw == 1 { reason = CloseReason.Expired }
+                if raw == 2 { reason = CloseReason.Dismissed }
+                if raw == 3 { reason = CloseReason.Closed }
+                return Some(Event.Closed(Closed{id: id, reason: reason}))
+            }
+        }
+        _ => {}
+    }
+    return None
+}

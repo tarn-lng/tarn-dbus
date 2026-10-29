@@ -1,0 +1,64 @@
+// Manual check on the real desktop: shows a notification with two buttons,
+// replaces it once, then waits up to 60 s for a click or dismissal.
+import "desktop/notifications"
+import "src/connection"
+import "src/error"
+import "os"
+import "string"
+
+fn show(bus &mut connection.Connection) Result<void, error.Error> {
+    info := try notifications.server_information(bus, 2000)
+    print("Server: " + info.name + " " + info.version + " (spec " + info.spec_version + ")")
+    try notifications.subscribe(bus)
+    first := notifications.Notification.new(&"Tarn", &"Hola desde Tarn")
+        .with_body(&"Enviada con tarn-dbus nativo: sin libdbus ni C.")
+        .with_icon(&"dialog-information")
+        .with_timeout(0)
+    id := try notifications.notify(bus, &first, 2000)
+    update := notifications.Notification.new(&"Tarn", &"Hola desde Tarn")
+        .with_body(&"Elige una opción o descártala.")
+        .with_icon(&"dialog-information")
+        .with_action(&"default", &"Abrir")
+        .with_action(&"yes", &"Me gusta")
+        .with_action(&"no", &"Cerrar")
+        .with_urgency(notifications.Urgency.Normal)
+        .with_timeout(0)
+        .replacing(id)
+    try notifications.notify(bus, &update, 2000)
+    print("Notification " + string.from_u64(u64(id)) + " shown; waiting up to 60 s...")
+    var waited = 0
+    for waited < 60 {
+        match try bus.receive(1000) {
+            Some(item) => {
+                match notifications.event(&item) {
+                    Some(notifications.Event.ActionInvoked(found)) => {
+                        print("Action: " + found.text)
+                        try notifications.close(bus, id, 2000)
+                        return Ok(())
+                    }
+                    Some(notifications.Event.Closed(found)) => {
+                        match found.reason {
+                            notifications.CloseReason.Dismissed => { print("Dismissed by the user") }
+                            notifications.CloseReason.Expired => { print("Expired") }
+                            _ => { print("Closed") }
+                        }
+                        return Ok(())
+                    }
+                    _ => {}
+                }
+            }
+            None => { waited = waited + 1 }
+        }
+    }
+    print("No answer; closing it")
+    try notifications.close(bus, id, 2000)
+    return Ok(())
+}
+
+fn main() {
+    match connection.with_session(fn(bus &mut connection.Connection) Result<void, error.Error> { return show(bus) }) {
+        Ok(_) => {}
+        Err(e) => { print(e.name + ": " + e.message)
+            os.exit(1) }
+    }
+}

@@ -1,0 +1,87 @@
+// Tray server for tests/run_tray.py: a fake watcher and host on an isolated
+// bus drive it. Menu: Show (1), Dark mode checkbox (2), separator (3), More
+// submenu (4) with Alpha (5), Quit (6).
+import "desktop/dbusmenu"
+import "desktop/status_notifier"
+import "src/connection"
+import "src/error"
+import "console"
+import "io"
+import "os"
+import "string"
+
+fn items(dark bool, extra bool) Vec<dbusmenu.Item> {
+    var more: Vec<dbusmenu.Item> = Vec.new()
+    more.push(dbusmenu.entry(5, &"Alpha"))
+    if extra { more.push(dbusmenu.entry(7, &"Beta")) }
+    var out: Vec<dbusmenu.Item> = Vec.new()
+    out.push(dbusmenu.entry(1, &"Mostrar").with_icon(&"window-new"))
+    out.push(dbusmenu.checkbox(2, &"Modo oscuro", dark))
+    out.push(dbusmenu.separator(3))
+    out.push(dbusmenu.entry(4, &"Más").with_children(more))
+    out.push(dbusmenu.entry(6, &"Salir"))
+    return out
+}
+
+fn serve(bus &mut connection.Connection) Result<void, error.Error> {
+    var dark = false
+    var tray = try status_notifier.start(bus, &"tarn-test", &"Tarn Test", &"applications-development", items(false, false))
+    // Invalid menus are refused before anything is published.
+    var dup: Vec<dbusmenu.Item> = Vec.new()
+    dup.push(dbusmenu.entry(1, &"A"))
+    dup.push(dbusmenu.entry(1, &"B"))
+    match tray.set_menu(bus, dup) { Ok(_) => { return Err(error.invalid("duplicate menu ids accepted")) }
+        Err(_) => {} }
+    match status_notifier.pixmap_from_rgba(2, 2, &[3]u8{0, 0, 0}) { Ok(_) => { return Err(error.invalid("short pixmap accepted")) }
+        Err(_) => {} }
+    var out = console.stdout()
+    var registered = "no"
+    if tray.is_registered() { registered = "yes" }
+    try out.write_text(&("READY " + tray.service_name() + " " + registered + "\n")).map_err(fn(_f io.Error) error.Error { return error.invalid("stdout") })
+    for {
+        match try bus.receive(10000) {
+            Some(incoming) => {
+                events := try tray.handle(bus, incoming)
+                for event in events.as_slice() {
+                    match event {
+                        status_notifier.Event.Activate(at) => {
+                            try tray.set_title(bus, &("Activado en " + string.from_i64(i64(at.x)) + "," + string.from_i64(i64(at.y))))
+                        }
+                        status_notifier.Event.SecondaryActivate(_) => { try tray.set_status(bus, status_notifier.Status.NeedsAttention) }
+                        status_notifier.Event.Scroll(step) => {
+                            try tray.set_tooltip(bus, &"", &"Scroll", &(string.from_i64(i64(step.delta)) + " " + step.orientation.clone()))
+                        }
+                        status_notifier.Event.Menu(item) => {
+                            if item.kind.eq(&"clicked") && item.id == 2 {
+                                dark = !dark
+                                try tray.set_menu(bus, items(dark, false))
+                            }
+                            if item.kind.eq(&"clicked") && item.id == 5 { try tray.set_menu(bus, items(dark, true)) }
+                            if item.kind.eq(&"clicked") && item.id == 1 {
+                                var rgba: Vec<u8> = Vec.new()
+                                rgba.extend_from_slice(&[4]u8{10, 20, 30, 255})
+                                images := [1]status_notifier.Pixmap{try status_notifier.pixmap_from_rgba(1, 1, rgba.as_slice())}
+                                var list: Vec<status_notifier.Pixmap> = Vec.new()
+                                for image in images { list.push(image) }
+                                try tray.set_icon_pixmaps(bus, &list)
+                            }
+                            if item.kind.eq(&"clicked") && item.id == 6 { return Ok(()) }
+                        }
+                        status_notifier.Event.Registered => { try out.write_text(&"REREGISTERED\n").map_err(fn(_f io.Error) error.Error { return error.invalid("stdout") }) }
+                        status_notifier.Event.WatcherGone => { try out.write_text(&"WATCHER-GONE\n").map_err(fn(_f io.Error) error.Error { return error.invalid("stdout") }) }
+                        _ => {}
+                    }
+                }
+            }
+            None => { return Err(error.new("test.Timeout", "No host activity")) }
+        }
+    }
+}
+
+fn main() {
+    match connection.with_session(fn(bus &mut connection.Connection) Result<void, error.Error> { return serve(bus) }) {
+        Ok(_) => { print("QUIT") }
+        Err(e) => { print("ERROR " + e.name + ": " + e.message)
+            os.exit(1) }
+    }
+}

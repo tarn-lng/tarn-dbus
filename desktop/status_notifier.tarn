@@ -1,0 +1,313 @@
+// KDE/freedesktop StatusNotifierItem with a com.canonical.dbusmenu menu.
+// Publishes /StatusNotifierItem and /MenuBar, registers with the
+// StatusNotifierWatcher and registers again whenever the watcher restarts.
+// Spec binding only: what clicks and menu entries do belongs to the app.
+import "desktop/dbusmenu"
+import "src/connection"
+import "src/error"
+import "src/message"
+import "src/router"
+import "src/value"
+import "fs"
+import "io"
+import "string"
+
+fn item_path() string { return "/StatusNotifierItem" }
+fn menu_path() string { return "/MenuBar" }
+fn item_interface() string { return "org.kde.StatusNotifierItem" }
+fn watcher_name() string { return "org.kde.StatusNotifierWatcher" }
+
+/// ARGB32 image in network byte order (A, R, G, B per pixel), as the spec wants.
+pub struct Pixmap { pub width i32
+    pub height i32
+    pub argb Vec<u8> }
+
+/// Converts RGBA rows (R, G, B, A per pixel) to the spec's ARGB order.
+/// Icons are limited to 256x256.
+pub fn pixmap_from_rgba(width i32, height i32, rgba &[]u8) Result<Pixmap, error.Error> {
+    if width <= 0 || height <= 0 || width > 256 || height > 256 { return Err(error.invalid("Icon size must be 1..256 pixels")) }
+    if rgba.len() != usize(width) * usize(height) * 4 { return Err(error.invalid("RGBA data does not match the icon size")) }
+    var out: Vec<u8> = Vec.with_capacity(rgba.len())
+    var index: usize = 0
+    for index < rgba.len() {
+        out.push(rgba[index + 3])
+        out.push(rgba[index])
+        out.push(rgba[index + 1])
+        out.push(rgba[index + 2])
+        index = index + 4
+    }
+    return Ok(Pixmap{width: width, height: height, argb: out})
+}
+
+fn pixmaps(images &Vec<Pixmap>) value.Value {
+    var items: Vec<value.Value> = Vec.new()
+    for image in images.as_slice() {
+        var fields: Vec<value.Value> = Vec.new()
+        fields.push(value.Value.I32(image.width))
+        fields.push(value.Value.I32(image.height))
+        var data: Vec<u8> = Vec.new()
+        data.extend_from_slice(image.argb.as_slice())
+        fields.push(value.Value.Bytes(data))
+        items.push(value.structure(fields))
+    }
+    return value.array(&"(iiay)", items)
+}
+
+fn tooltip(icon &string, title &string, text &string) value.Value {
+    var fields: Vec<value.Value> = Vec.new()
+    fields.push(value.text(icon))
+    fields.push(pixmaps(&Vec.new()))
+    fields.push(value.text(title))
+    fields.push(value.text(text))
+    return value.structure(fields)
+}
+
+fn args(pairs &[]string) Vec<router.Arg> {
+    var out: Vec<router.Arg> = Vec.new()
+    var index: usize = 0
+    for index + 1 < pairs.len() {
+        out.push(router.arg(&pairs[index], &pairs[index + 1]))
+        index = index + 2
+    }
+    return out
+}
+
+fn description() router.Interface {
+    var out = router.describe(&item_interface())
+    out = out.method(&"ContextMenu", args(&[4]string{"x", "i", "y", "i"}), Vec.new())
+    out = out.method(&"Activate", args(&[4]string{"x", "i", "y", "i"}), Vec.new())
+    out = out.method(&"SecondaryActivate", args(&[4]string{"x", "i", "y", "i"}), Vec.new())
+    out = out.method(&"Scroll", args(&[4]string{"delta", "i", "orientation", "s"}), Vec.new())
+    out = out.method(&"ProvideXdgActivationToken", args(&[2]string{"token", "s"}), Vec.new())
+    out = out.signal(&"NewTitle", Vec.new())
+    out = out.signal(&"NewIcon", Vec.new())
+    out = out.signal(&"NewAttentionIcon", Vec.new())
+    out = out.signal(&"NewOverlayIcon", Vec.new())
+    out = out.signal(&"NewToolTip", Vec.new())
+    out = out.signal(&"NewStatus", args(&[2]string{"status", "s"}))
+    out = out.property(&"Category", &"s", &"read")
+    out = out.property(&"Id", &"s", &"read")
+    out = out.property(&"Title", &"s", &"read")
+    out = out.property(&"Status", &"s", &"read")
+    out = out.property(&"WindowId", &"i", &"read")
+    out = out.property(&"IconThemePath", &"s", &"read")
+    out = out.property(&"IconName", &"s", &"read")
+    out = out.property(&"IconPixmap", &"a(iiay)", &"read")
+    out = out.property(&"OverlayIconName", &"s", &"read")
+    out = out.property(&"OverlayIconPixmap", &"a(iiay)", &"read")
+    out = out.property(&"AttentionIconName", &"s", &"read")
+    out = out.property(&"AttentionIconPixmap", &"a(iiay)", &"read")
+    out = out.property(&"AttentionMovieName", &"s", &"read")
+    out = out.property(&"ToolTip", &"(sa(iiay)ss)", &"read")
+    out = out.property(&"ItemIsMenu", &"b", &"read")
+    out = out.property(&"Menu", &"o", &"read")
+    return out
+}
+
+pub enum Status { Passive
+    Active
+    NeedsAttention }
+fn status_text(state Status) string {
+    match state { Status.Passive => { return "Passive" }
+        Status.Active => { return "Active" }
+        Status.NeedsAttention => { return "NeedsAttention" } }
+}
+
+pub struct Point { pub x i32
+    pub y i32 }
+pub struct Scroll { pub delta i32
+    pub orientation string }
+
+pub enum Event {
+    /// Primary click on the icon.
+    Activate(Point)
+    /// Middle click.
+    SecondaryActivate(Point)
+    /// The host asks the app to show its own menu (only when no Menu is used).
+    ContextMenu(Point)
+    Scroll(Scroll)
+    /// A menu interaction: kind "clicked", "opened" or "closed".
+    Menu(dbusmenu.Event)
+    /// The watcher (re)appeared and the item is registered with it.
+    Registered
+    /// The watcher went away; the icon is not shown until it returns.
+    WatcherGone
+    /// Any message that is not for the tray.
+    Other(message.Message)
+}
+
+pub struct Tray {
+    pub routes router.Router
+    pub menu dbusmenu.Menu
+    service string
+    registered bool
+    activation_token string
+}
+
+fn process_id() Result<string, error.Error> {
+    raw := try fs.read(&"/proc/self/stat").map_err(fn(_failure io.Error) error.Error { return error.invalid("Cannot read /proc/self/stat") })
+    text := string.from_utf8(raw.as_slice()).unwrap_or("")
+    fields := string.fields(&text)
+    if fields.is_empty() { return Err(error.invalid("Empty /proc/self/stat")) }
+    return Ok(fields.get(0).clone())
+}
+
+/// Publishes the item and its menu, and registers with the watcher if one
+/// is running (see `registered`). `id` is a stable application identifier.
+pub fn start(bus &mut connection.Connection, id &string, title &string, icon_name &string, items Vec<dbusmenu.Item>) Result<Tray, error.Error> {
+    var routes = router.Router.new()
+    path := item_path()
+    iface := item_interface()
+    try routes.register(&path, description())
+    menu := try dbusmenu.Menu.new(&mut routes, &menu_path(), items)
+    var none: Vec<Pixmap> = Vec.new()
+    try routes.set_property(&path, &iface, &"Category", value.text(&"ApplicationStatus"))
+    try routes.set_property(&path, &iface, &"Id", value.text(id))
+    try routes.set_property(&path, &iface, &"Title", value.text(title))
+    try routes.set_property(&path, &iface, &"Status", value.text(&"Active"))
+    try routes.set_property(&path, &iface, &"WindowId", value.Value.I32(0))
+    try routes.set_property(&path, &iface, &"IconThemePath", value.text(&""))
+    try routes.set_property(&path, &iface, &"IconName", value.text(icon_name))
+    try routes.set_property(&path, &iface, &"IconPixmap", pixmaps(&none))
+    try routes.set_property(&path, &iface, &"OverlayIconName", value.text(&""))
+    try routes.set_property(&path, &iface, &"OverlayIconPixmap", pixmaps(&none))
+    try routes.set_property(&path, &iface, &"AttentionIconName", value.text(&""))
+    try routes.set_property(&path, &iface, &"AttentionIconPixmap", pixmaps(&none))
+    try routes.set_property(&path, &iface, &"AttentionMovieName", value.text(&""))
+    try routes.set_property(&path, &iface, &"ToolTip", tooltip(icon_name, title, &""))
+    try routes.set_property(&path, &iface, &"ItemIsMenu", value.Value.Bool(false))
+    try routes.set_property(&path, &iface, &"Menu", value.path(&menu_path()))
+    pid := try process_id()
+    service := "org.kde.StatusNotifierItem-" + pid + "-1"
+    try bus.request_name(&service)
+    try bus.add_match(&("type='signal',sender='org.freedesktop.DBus',interface='org.freedesktop.DBus',member='NameOwnerChanged',arg0='" + watcher_name() + "'"))
+    var tray = Tray{routes: routes, menu: menu, service: service, registered: false, activation_token: ""}
+    try tray.register_with_watcher(bus)
+    return Ok(tray)
+}
+
+fn Tray.register_with_watcher(&mut self, bus &mut connection.Connection) Result<void, error.Error> {
+    var body: Vec<value.Value> = Vec.new()
+    body.push(value.text(&self.service))
+    request := message.call(&watcher_name(), &"/StatusNotifierWatcher", &watcher_name(), &"RegisterStatusNotifierItem", body)
+    match bus.call(request, 2000) {
+        Ok(_) => { self.registered = true }
+        Err(failure) => {
+            // No watcher (for example GNOME without the AppIndicator extension).
+            if failure.name.eq(&"org.freedesktop.DBus.Error.ServiceUnknown") || failure.name.eq(&"org.freedesktop.DBus.Error.NameHasNoOwner") {
+                self.registered = false
+            } else { return Err(failure) }
+        }
+    }
+    return Ok(())
+}
+
+/// True while a watcher has the item; false means no host shows the icon.
+pub fn Tray.is_registered(&self) bool { return self.registered }
+/// Bus name the item is published under.
+pub fn Tray.service_name(&self) string { return self.service.clone() }
+/// Activation token from the host's last ProvideXdgActivationToken, to raise a window.
+pub fn Tray.activation_token(&self) string { return self.activation_token.clone() }
+
+fn point(call &router.Call) Point {
+    var x: i32 = 0
+    var y: i32 = 0
+    match call.args.get(0) { value.Value.I32(raw) => { x = raw }
+        _ => {} }
+    match call.args.get(1) { value.Value.I32(raw) => { y = raw }
+        _ => {} }
+    return Point{x: x, y: y}
+}
+
+/// Handles one received message: tray and menu calls are answered here and
+/// turned into events; watcher restarts re-register the item.
+pub fn Tray.handle(&mut self, bus &mut connection.Connection, incoming message.Message) Result<Vec<Event>, error.Error> {
+    var events: Vec<Event> = Vec.new()
+    if incoming.kind == message.signal() && incoming.member.eq(&"NameOwnerChanged") && incoming.interface_name.eq(&"org.freedesktop.DBus") {
+        var texts: Vec<string> = Vec.new()
+        for item in incoming.body.as_slice() { match item { value.Value.Text(s) => { texts.push(s.clone()) }
+            _ => {} } }
+        if texts.len() == 3 && texts.get(0).eq(&watcher_name()) {
+            if texts.get(2).is_empty() {
+                self.registered = false
+                events.push(Event.WatcherGone)
+            } else {
+                try self.register_with_watcher(bus)
+                if self.registered { events.push(Event.Registered) }
+            }
+            return Ok(events)
+        }
+    }
+    match try self.routes.route(bus, incoming) {
+        router.Routed.Call(call) => {
+            var current = call
+            if current.interface_name.eq(&dbusmenu.menu_interface()) {
+                found := try self.menu.answer(bus, &mut current)
+                for item in found.as_slice() { events.push(Event.Menu(dbusmenu.Event{id: item.id, kind: item.kind.clone()})) }
+                return Ok(events)
+            }
+            member := current.member.clone()
+            if member.eq(&"Activate") { events.push(Event.Activate(point(&current))) }
+            if member.eq(&"SecondaryActivate") { events.push(Event.SecondaryActivate(point(&current))) }
+            if member.eq(&"ContextMenu") { events.push(Event.ContextMenu(point(&current))) }
+            if member.eq(&"Scroll") {
+                var delta: i32 = 0
+                var orientation = ""
+                match current.args.get(0) { value.Value.I32(raw) => { delta = raw }
+                    _ => {} }
+                match current.args.get(1) { value.Value.Text(s) => { orientation = s.clone() }
+                    _ => {} }
+                events.push(Event.Scroll(Scroll{delta: delta, orientation: orientation}))
+            }
+            if member.eq(&"ProvideXdgActivationToken") {
+                match current.args.get(0) { value.Value.Text(s) => { self.activation_token = s.clone() }
+                    _ => {} }
+            }
+            if current.is_answered() { return Ok(events) }
+            if member.eq(&"Set") {
+                try current.fail(bus, &"org.freedesktop.DBus.Error.PropertyReadOnly", &"Tray properties are read-only")
+            } else {
+                try current.reply(bus, Vec.new())
+            }
+        }
+        router.Routed.Handled => {}
+        router.Routed.Other(other) => { events.push(Event.Other(other)) }
+    }
+    return Ok(events)
+}
+
+fn Tray.change(&mut self, bus &mut connection.Connection, name &string, item value.Value, signal &string, body Vec<value.Value>) Result<void, error.Error> {
+    if try self.routes.set_property(&item_path(), &item_interface(), name, item) {
+        try bus.signal(&item_path(), &item_interface(), signal, body, &"")
+        try self.routes.emit_changed(bus)
+    }
+    return Ok(())
+}
+
+pub fn Tray.set_title(&mut self, bus &mut connection.Connection, title &string) Result<void, error.Error> {
+    return self.change(bus, &"Title", value.text(title), &"NewTitle", Vec.new())
+}
+/// A themed icon name such as "mail-unread".
+pub fn Tray.set_icon_name(&mut self, bus &mut connection.Connection, name &string) Result<void, error.Error> {
+    return self.change(bus, &"IconName", value.text(name), &"NewIcon", Vec.new())
+}
+/// Raw icons, used when no themed name fits; several sizes may be given.
+pub fn Tray.set_icon_pixmaps(&mut self, bus &mut connection.Connection, images &Vec<Pixmap>) Result<void, error.Error> {
+    return self.change(bus, &"IconPixmap", pixmaps(images), &"NewIcon", Vec.new())
+}
+pub fn Tray.set_attention_icon_name(&mut self, bus &mut connection.Connection, name &string) Result<void, error.Error> {
+    return self.change(bus, &"AttentionIconName", value.text(name), &"NewAttentionIcon", Vec.new())
+}
+pub fn Tray.set_tooltip(&mut self, bus &mut connection.Connection, icon &string, title &string, text &string) Result<void, error.Error> {
+    return self.change(bus, &"ToolTip", tooltip(icon, title, text), &"NewToolTip", Vec.new())
+}
+pub fn Tray.set_status(&mut self, bus &mut connection.Connection, state Status) Result<void, error.Error> {
+    text := status_text(state)
+    var body: Vec<value.Value> = Vec.new()
+    body.push(value.text(&text))
+    return self.change(bus, &"Status", value.text(&text), &"NewStatus", body)
+}
+/// Replaces the menu; hosts get LayoutUpdated or ItemsPropertiesUpdated.
+pub fn Tray.set_menu(&mut self, bus &mut connection.Connection, items Vec<dbusmenu.Item>) Result<void, error.Error> {
+    return self.menu.update(bus, items)
+}
