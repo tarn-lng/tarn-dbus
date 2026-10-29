@@ -1,32 +1,203 @@
 # tarn-dbus
 
-An independent Tarn library for Linux session D-Bus, backed by the installed
-`libdbus-1` C library. It is **not part of Tarn's standard library**.
+An independent, pure Tarn library for the Linux session D-Bus. It speaks the
+D-Bus wire protocol over a Unix stream socket: no libdbus, no C, no FFI and no
+`unsafe`. It is **not part of Tarn's standard library**.
 
-Version 0.1 is a blocking client and signal foundation. The desktop widget currently keeps
-its Python adapter; this library does not yet publish tray objects or menus.
-
-## Requirements and validation
-
-- Current Tarn compiler with native FFI support, Linux x86_64.
-- `libdbus-1` plus headers/pkg-config for ABI validation (Debian/Ubuntu:
-  `libdbus-1-dev`). The validated local version is 1.16.2.
-- Test-only tools: C compiler, pkg-config, dbus-run-session, Python with dbus and
-  GLib bindings. Python is not linked or used by the library or example.
+Version 0.2 (in progress, see [the plan](docs/plan.md)) has a native
+connection with typed values, blocking and non-blocking calls and typed
+signals. The 0.1 API in `src/dbus` remains as a compatibility layer.
 
 ```sh
-TARN=/path/to/tarn/target/release/tarn ./test.sh
+TARN=/path/to/tarn ./test.sh
 ./build/list-names
 ```
 
-The test script verifies native layouts and builds explicitly with `--link
-dbus-1`, then creates an isolated session bus and a test-only Python service.
-It tests string arguments, scalar/container replies, remote errors, invalid
-arguments, actual timeout behavior, nested containers, oversized reply limits,
-descriptor cleanup after callback errors and compile-time connection escape rejection.
-It does not change the desktop service or communicate with desktop applications.
+## Native connection (`src/connection`)
 
-The example imports `src/dbus` from the project root:
+```tarn
+import "src/connection"
+import "src/message"
+import "src/value"
+fn work(bus &mut connection.Connection) Result<void, error.Error> {
+    var body: Vec<value.Value> = Vec.new()
+    body.push(value.text(&"org.freedesktop.DBus"))
+    reply := try bus.call(message.call(&"org.freedesktop.DBus", &"/org/freedesktop/DBus",
+        &"org.freedesktop.DBus", &"GetNameOwner", body), 1000)
+    return Ok(())
+}
+```
+
+- `with_session(work)` resolves `DBUS_SESSION_BUS_ADDRESS` (first
+  `unix:path=` entry, `%XX` escapes) or `$XDG_RUNTIME_DIR/bus`, authenticates
+  with SASL `EXTERNAL` (uid from `/proc/self/status`, 5 s bound), sends
+  `Hello`, and closes on every ordinary result, including `Err`. Abstract
+  sockets and other transports return `tarn.dbus.UnsupportedAddress`.
+- `send(message) -> serial` queues and writes what the socket accepts;
+  `flush(timeout)` finishes writing.
+- `call(message, timeout)` blocks for the reply; messages arriving meanwhile
+  stay queued in order. Remote errors keep their name and text.
+- `send_call(message, timeout) -> serial` does not block. The reply arrives
+  through `dispatch` or `receive` with that `reply_serial`; after the timeout,
+  a local `org.freedesktop.DBus.Error.NoReply` arrives instead and a late
+  real reply is dropped.
+- `dispatch(max)` never blocks; `receive(timeout)` waits at most 60 s for one
+  message. Waits use `poll`, so an idle connection uses no CPU.
+- `signal(path, interface, member, body, destination)` emits typed broadcast
+  or unicast signals.
+- `request_name`, `release_name`, `add_match`, `remove_match`, `list_names`,
+  `name_owner`, `unique_name`.
+- `raw_fd()` lends the socket descriptor to a foreign event loop (GLib).
+- Bounds: 4096 queued incoming messages (reading pauses), 16 MiB queued
+  output, timeouts up to 60000 ms. A reply whose body breaks a limit fails
+  only its own call; a malformed header ends the connection.
+
+## Publishing objects (`src/router`)
+
+The application describes its interfaces, routes each received message and
+answers the calls it gets back. No callbacks cross into the library.
+
+```tarn
+var routes = router.Router.new()
+try routes.register(&"/org/example/App", router.describe(&"org.example.App")
+    .method(&"Add", inputs, outputs)
+    .signal(&"Done", args))
+for {
+    match try bus.receive(1000) {
+        Some(incoming) => {
+            match try routes.route(bus, incoming) {
+                router.Routed.Call(call) => { var current = call
+                    try current.reply(bus, body) }
+                router.Routed.Handled => {}
+                router.Routed.Other(signal) => {}
+            }
+        }
+        None => {}
+    }
+}
+```
+
+- `route` checks the call's signature against the description before the app
+  sees it, and answers `UnknownObject`, `UnknownInterface`, `UnknownMethod`
+  and `InvalidArgs` itself.
+- Built in: `org.freedesktop.DBus.Peer` (`Ping`, `GetMachineId`) on every path,
+  and `Introspectable.Introspect` with generated XML, including child nodes.
+- Properties: declare them with `.property(name, signature, access)` and give
+  values with `set_property` (checked against the signature; returns whether
+  it changed). The router answers `Get` and `GetAll` (write-only properties
+  are omitted) with the standard errors. `Set` is checked (read-only, type)
+  and then returned to the app as a Call, which may refuse it or accept it
+  with `set_property`. `emit_changed` sends one batched `PropertiesChanged`
+  per object and interface; `invalidate` announces a name without its value.
+  The first value of a property is not announced.
+- `Call.reply` and `Call.fail` answer exactly once; `Connection.reply` and
+  `reply_error` send nothing when the caller set `NO_REPLY_EXPECTED`.
+- Calls without an interface match the first registered method of that name.
+- An unknown path is `UnknownObject` (GDBus reports `UnknownMethod` there; the
+  specification's name is used).
+
+## Desktop notifications (`desktop/notifications`)
+
+Binding of org.freedesktop.Notifications 1.2, with no application policy.
+
+```tarn
+item := notifications.Notification.new(&"My app", &"Done")
+    .with_body(&"The export finished.")
+    .with_action(&"default", &"Open")
+    .with_urgency(notifications.Urgency.Normal)
+try notifications.subscribe(bus)
+id := try notifications.notify(bus, &item, 2000)
+// later, for each received message:
+match notifications.event(&message) { Some(notifications.Event.ActionInvoked(found)) => { ... } _ => {} }
+```
+
+- `notify` returns the id; `replacing(id)` updates an existing notification.
+- Hints: `with_urgency`, `with_category`, `with_desktop_entry`,
+  `with_image_path`, `transient`, `resident`, or any `hint(key, value)`.
+- `close`, `capabilities`, `server_information`, `subscribe`.
+- `event` reads `ActionInvoked`, `ActivationToken` and `NotificationClosed`
+  (with `Expired`, `Dismissed`, `Closed` or `Undefined`).
+
+`notify_demo.tarn` is the manual check on the real desktop: it shows a
+notification, replaces it with one that has buttons and prints what you do.
+
+## Tray icon and menu (`desktop/status_notifier`, `desktop/dbusmenu`)
+
+StatusNotifierItem with a com.canonical.dbusmenu menu, as shown by Plasma's
+system tray. Spec binding only: what clicks do belongs to the application.
+
+```tarn
+var items: Vec<dbusmenu.Item> = Vec.new()
+items.push(dbusmenu.entry(1, &"Show").with_icon(&"window-new"))
+items.push(dbusmenu.checkbox(2, &"Do not disturb", false))
+items.push(dbusmenu.separator(3))
+items.push(dbusmenu.entry(4, &"Quit"))
+var tray = try status_notifier.start(bus, &"my-app", &"My app", &"applications-development", items)
+for {
+    match try bus.receive(60000) {
+        Some(incoming) => {
+            events := try tray.handle(bus, incoming)
+            // Activate(point), SecondaryActivate, Scroll, Menu(event), Registered, WatcherGone, Other(message)
+        }
+        None => {}
+    }
+}
+```
+
+- `start` publishes `/StatusNotifierItem` and `/MenuBar`, takes
+  `org.kde.StatusNotifierItem-<pid>-1` and registers with the watcher.
+  `is_registered()` is false when no watcher runs (no icon is shown).
+- When the watcher restarts, the item registers again by itself and
+  `handle` reports `WatcherGone` and `Registered`.
+- `set_title`, `set_icon_name`, `set_icon_pixmaps`, `set_attention_icon_name`,
+  `set_tooltip` and `set_status` update properties and send the matching
+  `New*` signal plus `PropertiesChanged`. `pixmap_from_rgba` converts RGBA to
+  the spec's ARGB byte order (up to 256×256).
+- Menus: `entry`, `checkbox`, `radio`, `separator`, `.with_icon`,
+  `.disabled`, `.hidden`, `.with_children`, with unique positive ids.
+  `set_menu` diffs the new tree: a structure change sends `LayoutUpdated`
+  with a new revision; property changes send `ItemsPropertiesUpdated` for the
+  changed items only. `GetLayout` honours depth and property filters.
+- `tray_demo.tarn` is the manual check on the desktop.
+
+## Wire format (`src/value`, `src/marshal`, `src/message`)
+
+- `src/value`: typed values for every D-Bus type except Unix FDs; containers
+  keep element signatures, `ay` is `Bytes`. Builders: `text`, `path`, `array`,
+  `structure`, `variant`, `dict_sv().put_sv(...)`.
+- `src/signature`: validation and splitting, with the spec's 255-byte and
+  32/32 nesting limits.
+- `src/names`: object path, interface, member, error and bus name rules.
+- `src/marshal`: encoding (little-endian) and bounded decoding of both byte
+  orders: zero padding, 0/1 booleans, UTF-8 strings without NUL, 64 MiB
+  arrays, 64 nested containers, 4096 values per message.
+- `src/message`: headers, per-type field rules, `frame_length` for stream
+  framing, `call`, `signal_message`, `reply_to`, `error_to`.
+
+`test_wire.tarn` runs offline. It compares Tarn bodies byte for byte with
+messages produced by GDBus (`tests/golden/messages.txt`, regenerated with
+`tests/golden/generate.py`), decodes those messages, and writes its own for
+`tests/golden/verify.py` to parse with GDBus. It also covers IEEE 754 edge
+cases, a 64×64 icon and hostile input (every truncation, bad padding,
+booleans, UTF-8, lengths, signatures and nesting).
+
+## Requirements and validation
+
+- Current Tarn compiler, Linux x86_64. No native libraries and no `--link`.
+- Test-only tools: `dbus-run-session` and Python with GObject introspection
+  (`gi`, Gio). Python provides the GDBus reference messages and the isolated
+  service; it is not used by the library.
+
+`test.sh` runs the offline wire tests (`test_wire.tarn`, GDBus golden messages
+in both directions), checks that a borrowed connection cannot escape its scope
+(E3079), then starts an isolated session bus with the GDBus fixture
+(`tests/fixture.py`) for `test_client.tarn` (0.1 API) and `test_native.tarn`
+(native API), a fake notification server for `test_notifications.tarn`, and
+`tests/run_router.py`, which drives the `test_router.tarn` server with GDBus,
+`gdbus introspect` and `busctl`, and `tests/run_tray.py`, which plays the
+watcher and the host for `test_tray.tarn`, including a watcher restart. It never talks to the desktop session bus.
+
+## 0.1 compatibility layer (`src/dbus`)
 
 ```tarn
 import "src/dbus"
@@ -37,77 +208,13 @@ fn inspect(bus &mut dbus.Connection) Result<void, dbus.Error> {
 }
 ```
 
-`dbus.with_session(inspect)` acquires a private connection and closes it on every
-ordinary callback result, including Err. Raw handles do not escape. There are no
-user destructors or background collector processes. Panic follows Tarn's normal
-process-abort semantics. `Error` owns `name` and `message`; native errors retain
-their D-Bus identity and diagnostic text.
-
-## API and boundaries
-
-- `with_session(callback)` scopes a private session connection.
-- `Connection.list_names()` returns owned names.
-- `Connection.name_owner(name)` returns an owned owner name.
-- `Connection.call_strings(destination, path, interface_name, member, arguments,
-  timeout_ms)` calls a method with string arguments; timeout must be 1..60000 ms.
-- `Value` decodes string-like values, bool, i32, u32, u64, arrays, structs,
-  dictionary entries and variants into owned Tarn data. String, object-path and
-  signature replies currently share `Text`; exact wire signatures are not yet
-  preserved in the public value model.
-- Unsupported types fail explicitly. This includes double, byte, i16/u16/i64
-  and Unix file descriptors in 0.1. Maximum decoded depth is 32 and total value
-  count is 4096. This limit also applies to large arrays of values.
-- `Connection.request_name(name)` acquires a well-known name without replacing
-  its current owner or queuing; scope completion releases it.
-- `Connection.add_match(rule)` / `remove_match(rule)` manage subscriptions using
-  native D-Bus match grammar and preserve invalid-rule errors.
-- `Connection.signal(path, interface_name, member)` queues an empty signal;
-  there is no implicit unbounded flush or remote delivery guarantee.
-- `Connection.receive(timeout_ms)` returns at most one owned `Message`, with
-  type/path/interface/member/sender and decoded body. Wait is 0..60000 ms;
-  disconnected transport returns an error. It services transport when the local
-  queue is empty. Incoming replies and bus control signals may also be returned,
-  so applications filter by message type and metadata.
-- Calls block the current native task. No async executor or
-  server object publication, automatic reconnect or concurrent connection access
-  is provided. `Connection` contains a raw native handle and is not transferable.
+`with_session`, `list_names`, `name_owner`, `request_name`, `add_match`,
+`remove_match`, `receive`, `signal` (empty body) and `call_strings` keep their
+0.1 contracts on top of the native connection. Its `Value` model keeps 0.1
+behavior: strings, object paths and signatures share `Text`, and byte,
+int16/uint16, int64 and double replies return `tarn.dbus.UnsupportedType`.
+New code should use `src/connection` with `src/value`.
 
 For an application, copy/vendor the source under the application's module root
-or publish it through Tarn's existing source-package workflow. There is no
-registry release yet. Consumers must explicitly grant `--link dbus-1`; the
-library cannot grant native linking authority merely by being imported. No
-installation or build hook is required by the package.
-
-## Native dependency decision
-
-D-Bus authentication, message validation and transport are complex enough that
-an improvised wire implementation would be a poor foundation. `libdbus-1` is the
-focused protocol library already installed on the target system, avoiding a
-GLib/GIO dependency in the runtime library. No Cargo dependency or compiler
-change is added. Local `ldd` inspection lists libsystemd, libc and libm as loaded
-native dependencies; this is an observation of the installed build, not a
-complete supply-chain guarantee for every system distribution.
-
-C code is outside Tarn's memory-safety proof. The small unsafe boundary uses
-opaque handles, keeps C strings alive during synchronous calls, copies replies
-before unref and frees every acquired message/error/connection on ordinary
-success/failure. DBusMessageIter and DBusError use verified native storage;
-`tests/abi.c` must pass when changing the supported system ABI.
-
-## Next steps, guided by the widget
-
-1. Typed argument encoding and remaining reply types/signatures.
-2. Extend empty signals to typed bodies and add sender/destination/serial metadata.
-3. Method replies and object/property publication without C callback pointers.
-4. Separate StatusNotifierItem/dbusmenu application layer in status_device.
-5. Validate tray re-registration, shutdown and CPU before replacing Python.
-
-Desktop-specific types and policies belong above this protocol library.
-
-## Signal validation
-
-The isolated-bus tests acquire `org.tarn.Client`, reject taking the existing
-fixture name, subscribe to an interface/member, emit and receive a real empty
-signal, check owned metadata, remove the subscription, and reject malformed
-match rules, signal paths and negative receive waits. Server publication and
-method replies remain unimplemented; the running widget still uses Python.
+or publish it through Tarn's source-package workflow. There is no registry
+release yet.
