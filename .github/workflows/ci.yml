@@ -1,0 +1,28 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: tarn-lng/setup-tarn@v1
+        with:
+          version: "0.5.0"
+      # Live suites run on an isolated session bus against the GDBus fixture.
+      - name: Install D-Bus and PyGObject
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends dbus python3-gi gir1.2-glib-2.0
+      - name: Check package entry
+        run: tarn check lib.tarn
+      - name: Test
+        run: ./test.sh

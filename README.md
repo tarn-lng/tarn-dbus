@@ -4,9 +4,27 @@ An independent, pure Tarn library for the Linux session D-Bus. It speaks the
 D-Bus wire protocol over a Unix stream socket: no libdbus, no C, no FFI and no
 `unsafe`. It is **not part of Tarn's standard library**.
 
-Version 0.2 (in progress, see [the plan](docs/plan.md)) has a native
-connection with typed values, blocking and non-blocking calls and typed
-signals. The 0.1 API in `src/dbus` remains as a compatibility layer.
+Version 0.2.0 has a native connection with typed values, blocking and
+non-blocking calls, typed signals, object publication with properties, and the
+desktop protocols (notifications, StatusNotifierItem tray icons, dbusmenu); see
+[the plan](docs/plan.md) and the [changelog](CHANGELOG.md). The 0.1 API in
+`src/dbus` remains as a compatibility layer.
+
+## As a dependency
+
+```sh
+tarn add dbus --version "^0.2.0"
+```
+
+```tarn
+import "dbus/src/connection"
+import "dbus/desktop/notifications"
+```
+
+Linux only (Unix socket session bus); elsewhere `with_session` returns an
+error instead of connecting. Releases come from tags `vX.Y.Z` matching
+`tarn.toml`: [the release workflow](.github/workflows/release.yml) runs the
+suite and attaches `dbus-X.Y.Z.tar.gz` to an immutable GitHub release.
 
 ```sh
 TARN=/path/to/tarn ./test.sh

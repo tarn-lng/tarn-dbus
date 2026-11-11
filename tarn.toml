@@ -1,4 +1,4 @@
 [package]
 name = "dbus"
-version = "0.1.0"
-entry = "src/dbus.tarn"
+version = "0.2.0"
+entry = "lib.tarn"
