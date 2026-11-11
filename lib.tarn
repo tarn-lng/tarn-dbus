@@ -1,0 +1,26 @@
+// Package entry: every public module, so publication checks all of them.
+// Applications import the modules they use by path, for example
+// `import "dbus/src/connection"` or `import "dbus/desktop/notifications"`.
+import "src/dbus"
+import "src/connection"
+import "src/error"
+import "src/marshal"
+import "src/message"
+import "src/names"
+import "src/router"
+import "src/signature"
+import "src/value"
+import "desktop/dbusmenu"
+import "desktop/notifications"
+import "desktop/status_notifier"
+
+/// True when `path` is a valid D-Bus object path.
+pub fn valid_path(path &string) bool { return names.valid_path(path) }
+/// True when `code` is a basic D-Bus type code.
+pub fn is_basic(code u8) bool { return signature.is_basic(code) }
+
+// Names one type of each remaining module, so the entry checks them all
+// without unused imports. Not meant to be called.
+pub fn modules(a &dbus.Error, b &connection.Connection, c &error.Error, d &marshal.Writer,
+    e &message.Message, f &router.Method, g &value.Value, h &dbusmenu.Menu,
+    i &notifications.Urgency, j &status_notifier.Status) {}

@@ -1,0 +1,98 @@
+name: Release
+
+# Pushing tag vX.Y.Z (matching tarn.toml) runs the suite and attaches
+# dbus-X.Y.Z.tar.gz to an immutable GitHub release, which Tarn Registry
+# ingests. The archive holds only the package: manifest, entry, src/,
+# desktop/, README, CHANGELOG and licenses.
+on:
+  push:
+    tags:
+      - "v*.*.*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag (e.g. v0.2.0)"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  verify:
+    name: Verify & Package
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
+      tag: ${{ steps.meta.outputs.tag }}
+      archive: ${{ steps.meta.outputs.archive }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          ref: ${{ inputs.tag || github.ref }}
+      - uses: tarn-lng/setup-tarn@v1
+        with:
+          version: "0.5.0"
+      - name: Install D-Bus and PyGObject
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends dbus python3-gi gir1.2-glib-2.0
+      - name: Verify version, test and package
+        id: meta
+        env:
+          INPUT_TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          set -eu
+          TAG="$INPUT_TAG"
+          VERSION="${TAG#v}"
+          TOML_VERSION=$(sed -n 's/^version = "\([^"]*\)".*/\1/p' tarn.toml | head -n 1)
+          if [ "$VERSION" != "$TOML_VERSION" ]; then
+            echo "Tag $TAG does not match tarn.toml version $TOML_VERSION" >&2
+            exit 1
+          fi
+          tarn version
+          tarn check lib.tarn
+          ./test.sh
+          ARCHIVE="dbus-${VERSION}.tar.gz"
+          tar --sort=name --mtime='UTC 2026-01-01' --owner=0 --group=0 --numeric-owner \
+            -czf "$ARCHIVE" tarn.toml lib.tarn src desktop README.md CHANGELOG.md LICENSE-APACHE LICENSE-MIT
+          # The archive must publish on its own (no test or demo files needed).
+          mkdir -p "$RUNNER_TEMP/check" "$RUNNER_TEMP/registry"
+          tar -xzf "$ARCHIVE" -C "$RUNNER_TEMP/check"
+          (cd "$RUNNER_TEMP/check" && tarn publish --registry "file://$RUNNER_TEMP/registry/")
+          sha256sum "$ARCHIVE"
+          {
+            echo "tag=$TAG"
+            echo "version=$VERSION"
+            echo "archive=$ARCHIVE"
+          } >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-archive
+          path: ${{ steps.meta.outputs.archive }}
+          if-no-files-found: error
+
+  publish:
+    name: Publish GitHub Release
+    needs: verify
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-archive
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          TAG: ${{ needs.verify.outputs.tag }}
+          ARCHIVE: ${{ needs.verify.outputs.archive }}
+        run: |
+          # Releases are immutable: never replace an existing asset.
+          if gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1; then
+            echo "Release $TAG already exists" >&2
+            exit 1
+          fi
+          gh release create "$TAG" "$ARCHIVE" \
+            --repo "$REPO" \
+            --verify-tag \
+            --title "$TAG" \
+            --generate-notes

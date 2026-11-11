@@ -1,7 +1,11 @@
 # Changelog
 
-## Unreleased (0.2)
+## 0.2.0
 
+- Package entry is `lib.tarn` at the root, so `src/...` and `desktop/...`
+  imports resolve when published; applications import modules by path
+  (`dbus/src/connection`, `dbus/desktop/notifications`). CI and a release
+  workflow that attaches `dbus-X.Y.Z.tar.gz` to immutable GitHub releases.
 - Native wire format, milestone M1 of [the plan](docs/plan.md): typed values,
   signatures, name validation, marshalling and message headers in pure Tarn.
   Verified in both directions against GDBus.
